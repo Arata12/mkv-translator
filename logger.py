@@ -162,6 +162,13 @@ def debug(message: Any) -> None:
     _log_message(message, Color.BLUE)
 
 
+def log_only(message: Any) -> None:
+    """Store a message for file logging without printing it to the console."""
+    msg_str = str(message)
+    if _log_to_file:
+        _log_messages.append(msg_str)
+
+
 def save_thoughts(thoughts: str, batch_number: int, retry: int = 0) -> bool:
     """
     Save thinking process to thoughts file.

@@ -14,6 +14,7 @@ import subprocess
 import json
 import re
 import time
+import threading
 from pathlib import Path
 from collections import Counter
 import unicodedata
@@ -106,6 +107,7 @@ try:
         progress_bar,
         progress_complete,
         clear_progress,
+        progress_status,
         info_with_progress,
         warning_with_progress,
         error_with_progress,
@@ -687,7 +689,11 @@ def prompt_resume(saved_line, total_lines):
 
 
 def get_system_instruction(
-    source_lang, target_lang="Latin American Spanish", thinking=True, audio_file=None
+    source_lang,
+    target_lang="Latin American Spanish",
+    thinking=True,
+    audio_file=None,
+    gender_hints=False,
 ):
     """
     Generate system instruction for translation.
@@ -699,22 +705,29 @@ def get_system_instruction(
         else "\n\nDo NOT think or reason."
     )
 
-    # Field definitions (conditional based on audio_file)
-    fields = (
-        (
-            "- index: a string identifier\n"
-            "- content: the text to translate\n"
-            "- time_start: the start time of the segment\n"
-            "- time_end: the end time of the segment\n"
+    fields = ["- index: a string identifier", "- content: the text to translate"]
+    if audio_file:
+        fields.extend(
+            [
+                "- time_start: the start time of the segment",
+                "- time_end: the end time of the segment",
+            ]
         )
-        if audio_file
-        else ("- index: a string identifier\n- content: the text to translate\n")
-    )
+    if gender_hints:
+        fields.extend(
+            [
+                "- speaker_gender: optional hint (male/female/unknown)",
+                "- addressee_gender: optional hint (male/female/mixed/unknown)",
+                "- addressee_number: optional hint (singular/plural/unknown)",
+                "- gender_confidence: optional hint (low/medium/high)",
+            ]
+        )
+    fields_text = "\n".join(fields) + "\n"
 
     instruction = f"""You are an assistant that translates subtitles from {source_lang} to {target_lang}.
 
 You will receive a list of objects, each with these fields:
-{fields}
+{fields_text}
 Translate the 'content' field of each object.
 If the 'content' field is empty, leave it as is.
 Preserve line breaks, formatting, and special characters.
@@ -737,13 +750,105 @@ Analyze the speaker's voice in the audio to determine gender, then apply grammat
 2. In some cases you also need to identify who the current speaker is talking to:
    - If the speaker is talking to a male, use masculine forms.
    - If the speaker is talking to a female, use feminine forms.
-   - If the speaker is talking to a group, use plural forms.
-   - Example: Portuguese 'You are tired' -> 'Você está cansado' (male) vs 'Você está cansada' (female)
-   - Example: Spanish 'You are talking to a group' -> 'Ustedes están cansados' (male/general group) vs 'Ustedes están cansadas' (female group)"""
+    - If the speaker is talking to a group, use plural forms.
+    - Example: Portuguese 'You are tired' -> 'Você está cansado' (male) vs 'Você está cansada' (female)
+    - Example: Spanish 'You are talking to a group' -> 'Ustedes están cansados' (male/general group) vs 'Ustedes están cansadas' (female group)"""
+
+    if gender_hints:
+        instruction += f"""
+
+Some objects may include precomputed gender hints.
+Use them as guidance for grammatical agreement in {target_lang}:
+- speaker_gender applies to first-person or self-descriptive lines
+- addressee_gender and addressee_number apply when the speaker is addressing someone directly
+- gender_confidence tells you how strongly to trust the hints
+- If a hint is unknown or low confidence, rely on dialogue context or prefer neutral wording when natural"""
 
     instruction += thinking_instruction
 
     return instruction
+
+
+def get_safety_settings():
+    """Build permissive safety settings for subtitle translation content."""
+    return [
+        types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+        ),
+        types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+        ),
+    ]
+
+
+def get_audio_analysis_instruction(
+    source_lang, target_lang="Latin American Spanish"
+):
+    """Build system instruction for audio-only gender analysis fallback."""
+    return f"""You analyze subtitle-timed dialogue audio to provide grammatical gender hints for translation from {source_lang} to {target_lang}.
+
+You will receive a list of objects with these fields:
+- index: a string identifier
+- content: the subtitle text
+- time_start: subtitle start timestamp in milliseconds
+- time_end: subtitle end timestamp in milliseconds
+
+You will also receive an audio file.
+For each object, inspect the audio around the provided timestamps and return a JSON array with exactly one object per input item.
+
+Return only these fields:
+- index: same identifier from input
+- speaker_gender: male, female, or unknown
+- addressee_gender: male, female, mixed, or unknown
+- addressee_number: singular, plural, or unknown
+- confidence: low, medium, or high
+
+Rules:
+- Use the subtitle text and the timed audio together.
+- Return unknown when the audio does not make the answer clear.
+- Do not guess.
+- Do not translate the text.
+- Do not add explanations outside the JSON array."""
+
+
+def get_audio_analysis_config(system_instruction):
+    """Build API configuration for structured audio analysis fallback."""
+    response_schema = types.Schema(
+        type=types.Type.ARRAY,
+        items=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "index": types.Schema(type=types.Type.STRING),
+                "speaker_gender": types.Schema(type=types.Type.STRING),
+                "addressee_gender": types.Schema(type=types.Type.STRING),
+                "addressee_number": types.Schema(type=types.Type.STRING),
+                "confidence": types.Schema(type=types.Type.STRING),
+            },
+            required=[
+                "index",
+                "speaker_gender",
+                "addressee_gender",
+                "addressee_number",
+                "confidence",
+            ],
+        ),
+    )
+
+    return types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=response_schema,
+        safety_settings=get_safety_settings(),
+        system_instruction=system_instruction,
+        temperature=0.0,
+        top_p=0.1,
+        top_k=1,
+    )
 
 
 def get_translation_config(
@@ -781,22 +886,6 @@ def get_translation_config(
         ),
     )
 
-    # Safety settings: allow all content (subtitles may contain mature content)
-    safety_settings = [
-        types.SafetySetting(
-            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
-        ),
-        types.SafetySetting(
-            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
-        ),
-        types.SafetySetting(
-            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
-        ),
-        types.SafetySetting(
-            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
-        ),
-    ]
-
     # Determine thinking mode compatibility
     # Supports: Gemini 2.0, 2.5, and 3.x models
     thinking_compatible = (
@@ -817,7 +906,7 @@ def get_translation_config(
     return types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=response_schema,
-        safety_settings=safety_settings,
+        safety_settings=get_safety_settings(),
         system_instruction=system_instruction,
         thinking_config=thinking_config,
         temperature=temperature,
@@ -986,6 +1075,167 @@ def build_resume_context(dialogue_lines, translated_subtitle, start_line, batch_
             parts=[types.Part(text=json.dumps(translated_batch, ensure_ascii=False))],
         ),
     ]
+
+
+def is_audio_capability_error(error_msg):
+    """Detect model errors caused by unsupported audio input."""
+    lower_msg = error_msg.lower()
+    audio_markers = [
+        "audio",
+        "audio/mpeg",
+        "modality",
+        "mime",
+        "inline_data",
+        "file_data",
+    ]
+    capability_markers = [
+        "unsupported",
+        "does not support",
+        "not support",
+        "not enabled",
+        "invalid argument",
+        "invalid_argument",
+        "only supports",
+        "input type",
+    ]
+    return any(marker in lower_msg for marker in audio_markers) and any(
+        marker in lower_msg for marker in capability_markers
+    )
+
+
+def analyze_audio_batch(
+    client,
+    audio_model_name,
+    batch,
+    audio_part,
+    source_lang,
+    target_lang="Latin American Spanish",
+): 
+    """Analyze audio for gender hints when the translation model cannot accept audio."""
+    system_instruction = get_audio_analysis_instruction(source_lang, target_lang)
+    config = get_audio_analysis_config(system_instruction)
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part(text=json.dumps(batch, ensure_ascii=False)), audio_part],
+        )
+    ]
+    start_time = time.time()
+    stop_event = threading.Event()
+
+    def audio_analysis_heartbeat():
+        while not stop_event.wait(15):
+            elapsed = int(time.time() - start_time)
+            progress_status(
+                f"Audio analysis still running with {audio_model_name}... {elapsed}s elapsed"
+            )
+
+    heartbeat_thread = threading.Thread(
+        target=audio_analysis_heartbeat, daemon=True
+    )
+    heartbeat_thread.start()
+
+    try:
+        response = client.models.generate_content(
+            model=audio_model_name, contents=contents, config=config
+        )
+    finally:
+        stop_event.set()
+
+    response_text = response.text or ""
+    analyzed_batch = json_repair.loads(response_text)
+
+    if not isinstance(analyzed_batch, list) or len(analyzed_batch) != len(batch):
+        raise ValueError(
+            f"Audio analysis response length mismatch: expected {len(batch)}, got {len(analyzed_batch) if isinstance(analyzed_batch, list) else 'invalid'}"
+        )
+
+    hints_by_index = {}
+    valid_speaker_genders = {"male", "female", "unknown"}
+    valid_addressee_genders = {"male", "female", "mixed", "unknown"}
+    valid_addressee_numbers = {"singular", "plural", "unknown"}
+    valid_confidences = {"low", "medium", "high"}
+
+    for item in analyzed_batch:
+        idx = str(item.get("index", ""))
+        hints_by_index[idx] = {
+            "speaker_gender": (
+                item.get("speaker_gender", "unknown").lower()
+                if item.get("speaker_gender", "unknown").lower()
+                in valid_speaker_genders
+                else "unknown"
+            ),
+            "addressee_gender": (
+                item.get("addressee_gender", "unknown").lower()
+                if item.get("addressee_gender", "unknown").lower()
+                in valid_addressee_genders
+                else "unknown"
+            ),
+            "addressee_number": (
+                item.get("addressee_number", "unknown").lower()
+                if item.get("addressee_number", "unknown").lower()
+                in valid_addressee_numbers
+                else "unknown"
+            ),
+            "confidence": (
+                item.get("confidence", "low").lower()
+                if item.get("confidence", "low").lower() in valid_confidences
+                else "low"
+            ),
+        }
+
+    return hints_by_index
+
+
+def probe_audio_input_support(client, model_name, sample_batch, audio_part):
+    """Check whether a translation model accepts audio input."""
+    system_instruction = (
+        "Return the same JSON array you receive, preserving index and content."
+    )
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "index": types.Schema(type=types.Type.STRING),
+                    "content": types.Schema(type=types.Type.STRING),
+                },
+                required=["index", "content"],
+            ),
+        ),
+        safety_settings=get_safety_settings(),
+        system_instruction=system_instruction,
+        temperature=0.0,
+        top_p=0.1,
+        top_k=1,
+    )
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part(text=json.dumps(sample_batch, ensure_ascii=False)), audio_part],
+        )
+    ]
+    client.models.generate_content(model=model_name, contents=contents, config=config)
+
+
+def attach_gender_hints_to_batch(batch, hints_by_index=None):
+    """Build a translation batch with optional gender hints attached."""
+    request_batch = []
+
+    for item in batch:
+        request_item = {"index": item["index"], "content": item["content"]}
+        if hints_by_index:
+            hints = hints_by_index.get(str(item["index"]))
+            if hints:
+                request_item["speaker_gender"] = hints["speaker_gender"]
+                request_item["addressee_gender"] = hints["addressee_gender"]
+                request_item["addressee_number"] = hints["addressee_number"]
+                request_item["gender_confidence"] = hints["confidence"]
+        request_batch.append(request_item)
+
+    return request_batch
 
 
 # Global variable to track last successful chunk size (like gemini-translator-srt)
@@ -1353,6 +1603,7 @@ def translate_ass_file(
     ass_path,
     api_manager,
     model_name,
+    audio_model_name,
     output_dir,
     original_mkv_stem,
     lang_code,
@@ -1676,12 +1927,43 @@ def translate_ass_file(
                         output_ass_path.unlink()
                     progress_file_path.unlink()
 
+        use_audio_fallback = False
+
+        if audio_part and lines_to_translate:
+            sample_idx = lines_to_translate[0]
+            audio_probe_batch = [
+                {
+                    "index": str(sample_idx),
+                    "content": dialogue_lines[sample_idx],
+                    "time_start": str(dialogue_events[sample_idx].start),
+                    "time_end": str(dialogue_events[sample_idx].end),
+                }
+            ]
+            try:
+                probe_audio_input_support(
+                    client=api_manager.get_client(),
+                    model_name=model_name,
+                    sample_batch=audio_probe_batch,
+                    audio_part=audio_part,
+                )
+            except Exception as probe_error:
+                if is_audio_capability_error(str(probe_error)):
+                    use_audio_fallback = True
+                    logger.info(
+                        f"Model {model_name} does not accept audio input. Using {audio_model_name} for gender analysis fallback."
+                    )
+                else:
+                    logger.warning(
+                        f"Audio capability probe failed unexpectedly: {probe_error}. Proceeding with normal translation flow."
+                    )
+
         # Build system instruction (with audio context if available)
         system_instruction = get_system_instruction(
             lang_code,
             target_lang="Latin American Spanish",
             thinking=thinking,
-            audio_file=audio_file,
+            audio_file=audio_file if not use_audio_fallback else None,
+            gender_hints=use_audio_fallback,
         )
 
         # Configure API - get client from manager
@@ -1794,7 +2076,6 @@ def translate_ass_file(
         batch = []  # Initialize batch outside loop for signal handler access
         while i < total:
             batch = []
-            validated = False
 
             # Build batch up to batch_size
             batch_start_i = i
@@ -1811,13 +2092,47 @@ def translate_ass_file(
                 batch.append(batch_item)
                 i += 1
 
-            # Validate batch size against token limit
-            while not validated:
-                if not validate_batch_tokens(client, batch, model_name):
-                    # Clear progress bar for cleaner token validation display
-                    clear_progress()
+            batch_end_i = batch_start_i + len(batch)
+            logger.log_only(
+                f"Starting batch {batch_number}: items {batch_start_i + 1}-{batch_end_i}/{total}"
+            )
 
-                    # Reduce batch size and retry
+            # Translate batch with partial success tracking
+            try:
+                request_batch = batch
+                request_audio_part = audio_part
+                request_audio_file = audio_file if audio_part else None
+
+                if audio_part and use_audio_fallback:
+                    try:
+                        progress_status(
+                            f"Analyzing audio with {audio_model_name} for gender hints..."
+                        )
+                        gender_hints = analyze_audio_batch(
+                            client=client,
+                            audio_model_name=audio_model_name,
+                            batch=batch,
+                            audio_part=audio_part,
+                            source_lang=lang_code,
+                        )
+                        request_batch = attach_gender_hints_to_batch(
+                            batch, gender_hints
+                        )
+                    except Exception as analysis_error:
+                        warning_with_progress(
+                            f"Audio fallback analysis failed for this batch: {analysis_error}"
+                        )
+                        info_with_progress(
+                            "Continuing without gender hints for this batch."
+                        )
+                        request_batch = attach_gender_hints_to_batch(batch)
+
+                    request_audio_part = None
+                    request_audio_file = None
+
+                # Validate batch size against the actual request payload
+                while not validate_batch_tokens(client, request_batch, model_name):
+                    clear_progress()
                     new_batch_size = prompt_new_batch_size(batch_size)
                     decrement = batch_size - new_batch_size
                     if decrement > 0:
@@ -1825,14 +2140,26 @@ def translate_ass_file(
                             i -= 1
                             batch.pop()
                     batch_size = new_batch_size
+                    request_batch = batch
+                    request_audio_part = audio_part
+                    request_audio_file = audio_file if audio_part else None
+                    if audio_part and use_audio_fallback:
+                        try:
+                            gender_hints = analyze_audio_batch(
+                                client=client,
+                                audio_model_name=audio_model_name,
+                                batch=batch,
+                                audio_part=audio_part,
+                                source_lang=lang_code,
+                            )
+                            request_batch = attach_gender_hints_to_batch(
+                                batch, gender_hints
+                            )
+                        except Exception:
+                            request_batch = attach_gender_hints_to_batch(batch)
+                        request_audio_part = None
+                        request_audio_file = None
 
-                    # Continue silently - user already confirmed in prompt
-                    continue
-                # Token validation passed, continue silently
-                validated = True
-
-            # Translate batch with partial success tracking
-            try:
                 # Show sending indicator
                 progress_bar(
                     current=batch_start_i,
@@ -1847,7 +2174,7 @@ def translate_ass_file(
                 previous_message = process_batch_streaming(
                     client=client,
                     model_name=model_name,
-                    batch=batch,
+                    batch=request_batch,
                     previous_message=previous_message,
                     translated_subtitle=translated_subtitle,
                     config=config,
@@ -1856,12 +2183,18 @@ def translate_ass_file(
                     batch_number=batch_number,
                     keep_original=keep_original,
                     original_format=original_format,
-                    audio_part=audio_part,
-                    audio_file=audio_file,
+                    audio_part=request_audio_part,
+                    audio_file=request_audio_file,
                     dialogue_lines=dialogue_lines,
                     unique_text_indices=unique_text_indices,
                 )
                 batch_number += 1  # Increment for next batch
+
+                # Lock in completed progress before any next-batch prep/status updates.
+                progress_bar(current=i, total=total, model_name=model_name)
+                logger.log_only(
+                    f"Completed batch {batch_number - 1}: items {batch_start_i + 1}-{batch_end_i}/{total}"
+                )
 
                 # Save progress after successful batch
                 # Save index of next dialogue line to process (not position in lines_to_translate)
@@ -1898,6 +2231,35 @@ def translate_ass_file(
 
                 # Clear progress bar before logging
                 clear_progress()
+
+                if audio_part and not use_audio_fallback and is_audio_capability_error(
+                    error_msg
+                ):
+                    warning_with_progress(
+                        f"Model {model_name} rejected audio input. Switching to audio fallback model {audio_model_name}."
+                    )
+                    use_audio_fallback = True
+                    system_instruction = get_system_instruction(
+                        lang_code,
+                        target_lang="Latin American Spanish",
+                        thinking=thinking,
+                        audio_file=None,
+                        gender_hints=True,
+                    )
+                    config = get_translation_config(
+                        system_instruction,
+                        model_name,
+                        thinking,
+                        thinking_budget,
+                        temperature,
+                        top_p,
+                        top_k,
+                    )
+                    i = batch_start_i
+                    batch.clear()
+                    logger.save_logs()
+                    progress_bar(current=i, total=total, model_name=model_name)
+                    continue
 
                 # Handle quota errors with API switching or wait (gemini-srt-translator lines 553-564)
                 if (
@@ -2128,6 +2490,7 @@ def process_mkv_file(
     output_dir,
     api_manager,
     model_name,
+    audio_model_name,
     remembered_lang=None,
     batch_size=300,
     thinking=True,
@@ -2242,6 +2605,7 @@ def process_mkv_file(
             extracted_ass_path,
             api_manager,
             model_name,
+            audio_model_name,
             tmp_dir,
             mkv_path.stem,
             lang_code,
@@ -2301,9 +2665,14 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gemini-3.1-pro-preview",
-        help="The model to use for translation (default: 'gemini-3.1-pro-preview'). "
+        default="models/gemma-4-31b-it",
+        help="The model to use for translation (default: 'models/gemma-4-31b-it'). "
         "Note: Pro models may take longer for thinking, but have automatic timeout/retry.",
+    )
+    parser.add_argument(
+        "--audio-model",
+        default="models/gemini-3.1-flash-lite-preview",
+        help="Fallback model to analyze audio for gender hints when the translation model cannot accept audio input (default: 'models/gemini-3.1-flash-lite-preview').",
     )
     parser.add_argument(
         "--list-models",
@@ -2539,6 +2908,7 @@ def main():
                 args.output_dir,
                 api_manager,
                 args.model,
+                args.audio_model,
                 remembered_lang,
                 remembered_batch_size,
                 args.thinking,

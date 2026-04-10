@@ -6,7 +6,8 @@ A Python-based command-line tool that automatically extracts, translates, and re
 
 - **Automatic subtitle extraction** from MKV files using MKVToolNix
 - **AI-powered translation** to Latin American Spanish (es-419) via Google Gemini API
-- **Gender-aware translation** - analyzes audio to apply correct grammatical gender forms (verb conjugations, adjectives, pronouns)
+- **Gemma-first translation** - uses `models/gemma-4-31b-it` by default for subtitle translation
+- **Gender-aware translation** - analyzes audio to apply correct grammatical gender forms (verb conjugations, adjectives, pronouns), with automatic fallback to an audio-capable Gemini model when the main model does not support audio input
 - **Batch processing** with configurable batch sizes for efficient translation
 - **Resume capability** - automatically saves progress and resumes interrupted translations
 - **Dual API key support** - failover to secondary key when quota is reached
@@ -99,7 +100,8 @@ python3 translator.py [OPTIONS] INPUT_PATH
 **API Configuration:**
 - `--api-key KEY` - Primary Gemini API key (required if not set as environment variable)
 - `--api-key2 KEY` - Secondary API key for automatic failover when quota is reached
-- `--model NAME` - Gemini model to use (default: `gemini-3.1-pro-preview`)
+- `--model NAME` - Model to use for subtitle translation (default: `models/gemma-4-31b-it`)
+- `--audio-model NAME` - Fallback model for audio-based gender analysis when `--model` does not accept audio input (default: `models/gemini-3.1-flash-lite-preview`)
 - `--list-models` - List all available Gemini models and exit
 
 **Translation Options:**
@@ -115,7 +117,7 @@ python3 translator.py [OPTIONS] INPUT_PATH
 
 **Output Options:**
 - `--output-dir DIR` - Output directory for translated files (default: `translated_subs/`)
-- `--progress-log` - Save translation progress to log file
+- `--progress-log` - Save translation progress to log file, including batch boundaries and hidden progress statuses
 - `--thoughts-log` - Save AI thinking process to separate log file
 - `--no-colors` - Disable colored terminal output
 
@@ -159,7 +161,17 @@ python3 translator.py \
 ```bash
 python3 translator.py \
   --api-key YOUR_KEY \
-  --model gemini-3.1-pro-preview \
+  --model models/gemini-3.1-pro-preview \
+  video.mkv
+```
+
+**Use a non-audio model with explicit audio fallback:**
+```bash
+python3 translator.py \
+  --api-key YOUR_KEY \
+  --model models/gemma-4-31b-it \
+  --audio-model models/gemini-3.1-flash-lite-preview \
+  --extract-audio \
   video.mkv
 ```
 
@@ -198,11 +210,12 @@ python3 translator.py \
 5. **ASS Preprocessing** - Normalizes malformed color codes and protects formatting directives
 6. **Parsing** - Parses subtitle file using pysubs2 library
 7. **Filtering** - Filters out short lines and metadata, applies language-aware rules
-8. **Batch Translation** - Groups lines into batches and sends to Gemini API with streaming (includes audio if available)
-9. **Real-time Processing** - Applies translations as they arrive from the API
-10. **Format Restoration** - Restores original ASS formatting tags and styles
-11. **Merging** - Creates new MKV file with translated subtitles using `mkvmerge`
-12. **Cleanup** - Removes temporary files and saves logs if enabled
+8. **Batch Translation** - Groups lines into batches and sends them to the selected translation model with streaming
+9. **Audio Fallback Analysis** (automatic when needed) - If the selected translation model rejects audio input, sends timed audio batches to the fallback audio model and attaches the resulting gender hints to the translation request
+10. **Real-time Processing** - Applies translations as they arrive from the API
+11. **Format Restoration** - Restores original ASS formatting tags and styles
+12. **Merging** - Creates new MKV file with translated subtitles using `mkvmerge`
+13. **Cleanup** - Removes temporary files and saves logs if enabled
 
 ### Resume Functionality
 
@@ -224,7 +237,8 @@ When using dual API keys (`--api-key` and `--api-key2`):
 When audio is provided (`--extract-audio` or `--audio-file`), the tool analyzes speaker voices to apply correct grammatical gender:
 
 **How it works:**
-- Audio is sent to Gemini API alongside subtitle text
+- If the selected translation model supports audio, audio is sent alongside subtitle text
+- If the selected translation model does not support audio, the tool automatically falls back to `models/gemini-3.1-flash-lite-preview` for audio analysis and sends the resulting gender hints to the main translation model
 - AI analyzes voice characteristics at each subtitle timestamp
 - Applies gender-appropriate verb conjugations, adjectives, and pronouns
 - Essential for languages with grammatical gender (Spanish, French, etc.)
@@ -320,7 +334,7 @@ The tool applies intelligent filtering based on script type:
 **Poor translation quality**
 - Ensure `--thinking` mode is enabled (default)
 - Increase `--thinking-budget` (e.g., `--thinking-budget 4096`)
-- Try a more capable model (e.g., `--model gemini-3.1-pro-preview`)
+- Try a more capable model (e.g., `--model models/gemini-3.1-pro-preview`)
 
 **Colors not working in terminal**
 - Some terminals don't support ANSI colors
@@ -371,6 +385,7 @@ fi
 - **Batch-based processing** optimizes API usage and token limits
 - **Signal handling** for graceful interruption (Ctrl+C)
 - **Progress persistence** via JSON checkpoints in `tmp/` directory
+- **Automatic audio fallback** for non-audio translation models such as Gemma
 
 ### File Structure
 
@@ -391,7 +406,7 @@ fi
 
 The tool uses a sophisticated prompt system that:
 - Instructs Gemini to translate to Latin American Spanish (es-419)
-- Analyzes audio (when provided) for gender-aware translation
+- Analyzes audio (when provided) for gender-aware translation, either directly or through an automatic fallback audio model
 - Preserves line breaks and special characters via token replacement
 - Maintains subtitle formatting and timing
 - Protects ASS directives (\N, \n, \h) through mechanical substitution
