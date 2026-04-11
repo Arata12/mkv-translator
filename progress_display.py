@@ -9,15 +9,15 @@ Simplified from gemini-translator-srt's logger.py
 import os
 import sys
 import shutil
+import threading
 
 # Loading animation frames
 _LOADING_BARS = ["—", "\\", "|", "/"]
 _loading_bar_index = 0
 
-# Store last progress state for message updates
+# Store last progress state for updates
 _last_progress = None
-_previous_messages = []
-_rendered_lines = 0
+_render_lock = threading.RLock()
 
 # Track if progress bar has been displayed before
 _has_started = False
@@ -54,14 +54,36 @@ def supports_color():
     )
 
 
+def supports_cursor_control():
+    """Check if the terminal likely supports cursor movement for redraws."""
+    return (
+        hasattr(sys.stdout, "isatty")
+        and sys.stdout.isatty()
+        or "ANSICON" in os.environ
+        or "WT_SESSION" in os.environ
+        or os.environ.get("TERM_PROGRAM") == "vscode"
+    )
+
+
 def clear_lines(num_lines):
     """Clear specified number of lines using ANSI codes"""
-    if not sys.stdout.isatty():
+    if not supports_cursor_control():
         return
 
     for _ in range(num_lines):
         sys.stdout.write("\033[F")  # Move cursor up one line
         sys.stdout.write("\033[K")  # Clear the line
+
+
+def _truncate_text(text, max_length):
+    """Truncate text with ellipsis to fit a maximum visible length."""
+    if max_length <= 0:
+        return ""
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return text[:max_length]
+    return text[: max_length - 3] + "..."
 
 
 def progress_bar(current, total, model_name, chunk_size=0,
@@ -87,118 +109,105 @@ def progress_bar(current, total, model_name, chunk_size=0,
         message: Optional message to display below progress bar
         message_color: Color code for message (e.g., "\033[36m" for cyan)
     """
-    global _loading_bar_index, _last_progress, _previous_messages, _has_started, _rendered_lines
+    global _loading_bar_index, _last_progress, _has_started
 
-    # Save state for message updates
-    _last_progress = {
-        "current": current,
-        "total": total,
-        "model_name": model_name,
-        "chunk_size": chunk_size,
-        "is_loading": is_loading,
-        "is_sending": is_sending,
-        "is_thinking": is_thinking,
-        "is_retrying": is_retrying,
-        "retry_countdown": retry_countdown,
-        "bar_length": bar_length,
-        "thinking_time": thinking_time,
-        "status_detail": status_detail,
-        "status_color": status_color,
-    }
+    with _render_lock:
+        # Save state for message updates
+        _last_progress = {
+            "current": current,
+            "total": total,
+            "model_name": model_name,
+            "chunk_size": chunk_size,
+            "is_loading": is_loading,
+            "is_sending": is_sending,
+            "is_thinking": is_thinking,
+            "is_retrying": is_retrying,
+            "retry_countdown": retry_countdown,
+            "bar_length": bar_length,
+            "thinking_time": thinking_time,
+            "status_detail": status_detail,
+            "status_color": status_color,
+        }
 
-    # Calculate progress (add chunk_size for real-time progress within batch)
-    progress_ratio = (current + chunk_size) / total if total > 0 else 0
-    filled_length = int(bar_length * progress_ratio)
-    percentage = int(100 * progress_ratio)
+        term_width = shutil.get_terminal_size(fallback=(140, 20)).columns
 
-    # Build progress bar (plain text initially)
-    bar = '█' * filled_length + '░' * (bar_length - filled_length)
+        # Calculate progress (add chunk_size for real-time progress within batch)
+        progress_ratio = (current + chunk_size) / total if total > 0 else 0
+        percentage = int(100 * progress_ratio)
+        display_current = current + chunk_size
 
-    # Build status indicator
-    status = ""
-    if is_retrying:
-        status = f"| Retrying ({retry_countdown}s)"
-    elif is_sending:
-        status = "| Sending batch ↑↑↑"
-    elif is_thinking:
-        status = f"| Thinking {_LOADING_BARS[_loading_bar_index]}"
-        if thinking_time:
-            status += f" {thinking_time}"
-        _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
-    elif is_loading:
-        status = f"| Processing {_LOADING_BARS[_loading_bar_index]}"
-        _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
+        prefix_without_bar = f"Translating: || {percentage}% ({display_current}/{total})"
+        max_bar_length = max(10, term_width // 4)
+        bar_length = min(bar_length, max_bar_length)
+        filled_length = int(bar_length * progress_ratio)
 
-    # Build complete line (show current line + chunk_size for real-time feedback)
-    display_current = current + chunk_size
-    progress_text = (
-        f"Translating: "
-        f"|{bar}| {percentage}% ({display_current}/{total}) "
-        f"{model_name} {status}"
-    )
+        # Build progress bar (plain text initially)
+        bar = '█' * filled_length + '░' * (bar_length - filled_length)
 
-    # Apply colors if supported (matching gemini-translator-srt style)
-    if supports_color():
-        # Highlight filled blocks in green, then wrap everything in blue
-        progress_text = progress_text.replace("█", f"\033[32m█\033[34m")
-        # Highlight upload arrows in green
-        progress_text = progress_text.replace("↑", f"\033[32m↑\033[34m")
-        # Highlight loading animation characters in green
-        for char in _LOADING_BARS:
-            progress_text = progress_text.replace(char, f"\033[32m{char}\033[34m")
+        # Build status indicator
+        status = ""
+        if is_retrying:
+            status = f"| Retrying ({retry_countdown}s)"
+        elif is_sending:
+            status = "| Sending batch ↑↑↑"
+        elif is_thinking:
+            status = f"| Thinking {_LOADING_BARS[_loading_bar_index]}"
+            if thinking_time:
+                status += f" {thinking_time}"
+            _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
+        elif is_loading:
+            status = f"| Processing {_LOADING_BARS[_loading_bar_index]}"
+            _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
+
+        prefix = f"Translating: |{bar}| {percentage}% ({display_current}/{total})"
+        suffix_parts = [model_name]
+        if status:
+            suffix_parts.append(status)
         if status_detail:
-            if status_color:
-                progress_text += f" {status_color}{status_detail}\033[34m"
-            else:
-                progress_text += f" {status_detail}"
+            suffix_parts.append(status_detail)
+        suffix = " ".join(part for part in suffix_parts if part).strip()
 
-        # Wrap entire progress text in blue
-        progress_text = f"\033[34m{progress_text}\033[0m"
-    elif status_detail:
-        progress_text += f" {status_detail}"
-
-    # Clear previous output if in TTY (but only after first render)
-    if sys.stdout.isatty():
-        if _has_started:
-            # Move cursor to beginning of current line first
-            sys.stdout.write("\r")
-
-            # Move up and clear each line
-            for _ in range(_rendered_lines):
-                sys.stdout.write("\033[F")  # Move up
-                sys.stdout.write("\033[K")  # Clear line
+        if suffix:
+            available_suffix = max(0, term_width - len(prefix) - 1)
+            suffix = _truncate_text(suffix, available_suffix)
+            progress_text = f"{prefix} {suffix}".rstrip()
         else:
-            # First time displaying progress bar
+            progress_text = prefix
+
+        # Apply colors if supported (matching gemini-translator-srt style)
+        if supports_color():
+            # Highlight filled blocks in green, then wrap everything in blue
+            progress_text = progress_text.replace("█", f"\033[32m█\033[34m")
+            # Highlight upload arrows in green
+            progress_text = progress_text.replace("↑", f"\033[32m↑\033[34m")
+            # Highlight loading animation characters in green
+            for char in _LOADING_BARS:
+                progress_text = progress_text.replace(char, f"\033[32m{char}\033[34m")
+            # Wrap entire progress text in blue
+            progress_text = f"\033[34m{progress_text}\033[0m"
+
+        if supports_cursor_control():
             _has_started = True
-
-    lines_to_render = [progress_text]
-
-    # Display all previous messages
-    for msg_data in _previous_messages:
-        if supports_color() and msg_data.get("color"):
-            lines_to_render.append(f"{msg_data['color']}{msg_data['message']}\033[0m")
+            sys.stdout.write("\r\033[2K" + progress_text)
+            if message:
+                if supports_color() and message_color:
+                    sys.stdout.write(f"\n{message_color}{message}\033[0m")
+                else:
+                    sys.stdout.write(f"\n{message}")
+                sys.stdout.write("\n\r\033[2K" + progress_text)
         else:
-            lines_to_render.append(msg_data['message'])
+            print(progress_text)
+            if message:
+                print(message)
 
-    # Display and store new message if provided
-    if message:
-        _previous_messages.append({"message": message, "color": message_color})
-        if supports_color() and message_color:
-            lines_to_render.append(f"{message_color}{message}\033[0m")
-        else:
-            lines_to_render.append(message)
-
-    sys.stdout.write("\n".join(lines_to_render) + "\n")
-    _rendered_lines = len(lines_to_render)
-
-    sys.stdout.flush()
+        sys.stdout.flush()
 
 
 def progress_status(message: str, color: str = None) -> None:
     """Update the progress bar with a transient inline status message."""
     if _last_progress:
         _log_hidden_message(message)
-        if not sys.stdout.isatty():
+        if not supports_cursor_control():
             return
         progress_state = dict(_last_progress)
         progress_state["status_detail"] = message
@@ -238,45 +247,34 @@ def progress_complete(current, total, model_name):
     """
     Show completion message for translation.
     """
-    global _previous_messages, _has_started, _rendered_lines
+    global _has_started
 
     if supports_color():
         message = f"\033[32m✓ Translation complete ({current}/{total} lines) - {model_name}\033[0m"
     else:
         message = f"✓ Translation complete ({current}/{total} lines) - {model_name}"
 
-    if sys.stdout.isatty() and _has_started:
-        # Move cursor to beginning of current line first
-        sys.stdout.write("\r")
-        # Clear the progress bar and messages
-        for _ in range(_rendered_lines):
-            sys.stdout.write("\033[F")
-            sys.stdout.write("\033[K")
+    with _render_lock:
+        if supports_cursor_control() and _has_started:
+            sys.stdout.write("\r\033[2K")
 
-    print(message)
-    sys.stdout.flush()
+        print(message)
+        sys.stdout.flush()
 
-    # Reset state for next file
-    _previous_messages = []
-    _has_started = False
-    _rendered_lines = 0
+        # Reset state for next file
+        _has_started = False
 
 
 def clear_progress():
     """Clear the current progress line and messages"""
-    global _previous_messages, _has_started, _rendered_lines
+    global _has_started
 
-    if sys.stdout.isatty() and _has_started:
-        # Move cursor to beginning of current line first
-        sys.stdout.write("\r")
-        for _ in range(_rendered_lines):
-            sys.stdout.write("\033[F")
-            sys.stdout.write("\033[K")
-        sys.stdout.flush()
+    with _render_lock:
+        if supports_cursor_control() and _has_started:
+            sys.stdout.write("\r\033[2K")
+            sys.stdout.flush()
 
-    _previous_messages = []
-    _has_started = False
-    _rendered_lines = 0
+        _has_started = False
 
 
 def reset_progress_state():
@@ -284,8 +282,6 @@ def reset_progress_state():
     Reset progress bar state between files.
     Call this when starting translation of a new file in batch processing.
     """
-    global _previous_messages, _has_started, _last_progress, _rendered_lines
-    _previous_messages = []
+    global _has_started, _last_progress
     _has_started = False
     _last_progress = None
-    _rendered_lines = 0

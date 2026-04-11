@@ -8,6 +8,8 @@ Extracts subtitles from MKV files, translates them using Google Gemini, and merg
 """
 
 import argparse
+import contextlib
+import io
 import logging
 import sys
 import subprocess
@@ -101,13 +103,19 @@ class APIManager:
         return self.api_key2 is not None
 
 
+@contextlib.contextmanager
+def suppress_stderr_output():
+    """Temporarily silence stderr noise from third-party clients."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        yield
+
+
 # Import progress display module
 try:
     from progress_display import (
         progress_bar,
         progress_complete,
         clear_progress,
-        progress_status,
         info_with_progress,
         warning_with_progress,
         error_with_progress,
@@ -130,12 +138,17 @@ except ImportError:
 
 # --- Configuration ---
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.WARNING, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 # Suppress verbose HTTP logging from google/urllib and all submodules
 logging.getLogger("google").setLevel(logging.ERROR)
 logging.getLogger("google.genai").setLevel(logging.ERROR)
+logging.getLogger("google.genai.models").setLevel(logging.ERROR)
+logging.getLogger("google.genai._api_client").setLevel(logging.ERROR)
+logging.getLogger("google.genai._automatic_function_calling_util").setLevel(
+    logging.ERROR
+)
 logging.getLogger("google.ai").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
@@ -1110,7 +1123,10 @@ def analyze_audio_batch(
     audio_part,
     source_lang,
     target_lang="Latin American Spanish",
-): 
+    progress_current=0,
+    progress_total=0,
+    progress_model_name="",
+):
     """Analyze audio for gender hints when the translation model cannot accept audio."""
     system_instruction = get_audio_analysis_instruction(source_lang, target_lang)
     config = get_audio_analysis_config(system_instruction)
@@ -1122,13 +1138,30 @@ def analyze_audio_batch(
     ]
     start_time = time.time()
     stop_event = threading.Event()
+    progress_bar(
+        current=progress_current,
+        total=progress_total,
+        model_name=progress_model_name,
+        is_loading=True,
+        status_detail="Analyzing audio",
+    )
 
     def audio_analysis_heartbeat():
-        while not stop_event.wait(15):
+        heartbeat_count = 0
+        while not stop_event.wait(1):
             elapsed = int(time.time() - start_time)
-            progress_status(
-                f"Audio analysis still running with {audio_model_name}... {elapsed}s elapsed"
+            progress_bar(
+                current=progress_current,
+                total=progress_total,
+                model_name=progress_model_name,
+                is_loading=True,
+                status_detail="Analyzing audio",
             )
+            heartbeat_count += 1
+            if heartbeat_count % 15 == 0:
+                logger.log_only(
+                    f"Audio analysis still running with {audio_model_name}... {elapsed}s elapsed"
+                )
 
     heartbeat_thread = threading.Thread(
         target=audio_analysis_heartbeat, daemon=True
@@ -1136,11 +1169,13 @@ def analyze_audio_batch(
     heartbeat_thread.start()
 
     try:
-        response = client.models.generate_content(
-            model=audio_model_name, contents=contents, config=config
-        )
+        with suppress_stderr_output():
+            response = client.models.generate_content(
+                model=audio_model_name, contents=contents, config=config
+            )
     finally:
         stop_event.set()
+        heartbeat_thread.join(timeout=0.2)
 
     response_text = response.text or ""
     analyzed_batch = json_repair.loads(response_text)
@@ -1217,7 +1252,8 @@ def probe_audio_input_support(client, model_name, sample_batch, audio_part):
             parts=[types.Part(text=json.dumps(sample_batch, ensure_ascii=False)), audio_part],
         )
     ]
-    client.models.generate_content(model=model_name, contents=contents, config=config)
+    with suppress_stderr_output():
+        client.models.generate_content(model=model_name, contents=contents, config=config)
 
 
 def attach_gender_hints_to_batch(batch, hints_by_index=None):
@@ -2105,15 +2141,15 @@ def translate_ass_file(
 
                 if audio_part and use_audio_fallback:
                     try:
-                        progress_status(
-                            f"Analyzing audio with {audio_model_name} for gender hints..."
-                        )
                         gender_hints = analyze_audio_batch(
                             client=client,
                             audio_model_name=audio_model_name,
                             batch=batch,
                             audio_part=audio_part,
                             source_lang=lang_code,
+                            progress_current=batch_start_i,
+                            progress_total=total,
+                            progress_model_name=model_name,
                         )
                         request_batch = attach_gender_hints_to_batch(
                             batch, gender_hints
@@ -2151,6 +2187,9 @@ def translate_ass_file(
                                 batch=batch,
                                 audio_part=audio_part,
                                 source_lang=lang_code,
+                                progress_current=batch_start_i,
+                                progress_total=total,
+                                progress_model_name=model_name,
                             )
                             request_batch = attach_gender_hints_to_batch(
                                 batch, gender_hints
