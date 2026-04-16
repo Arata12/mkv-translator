@@ -11,6 +11,7 @@ import argparse
 import contextlib
 import io
 import logging
+import os
 import sys
 import subprocess
 import json
@@ -21,8 +22,18 @@ from pathlib import Path
 from collections import Counter
 import unicodedata
 
-from google import genai
-from google.genai import types
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
+try:
+    from ollama import Client as OllamaClient
+except ImportError:
+    OllamaClient = None
+
 import pysubs2
 
 try:
@@ -43,6 +54,358 @@ except ImportError:
 
 # --- API Manager for Dual API Key Support ---
 
+SUPPORTED_PROVIDERS = ("gemini", "ollama-local", "ollama-cloud")
+GEMINI_DEFAULT_MODEL = "models/gemma-4-31b-it"
+GEMINI_DEFAULT_AUDIO_MODEL = "models/gemini-3.1-flash-lite-preview"
+OLLAMA_DEFAULT_MODEL = "llama3.2"
+
+
+def is_gemini_provider(provider):
+    return provider == "gemini"
+
+
+def is_ollama_provider(provider):
+    return provider in {"ollama-local", "ollama-cloud"}
+
+
+def get_provider_display_name(provider):
+    return {
+        "gemini": "Google Gemini",
+        "ollama-local": "Ollama (local)",
+        "ollama-cloud": "Ollama Cloud",
+    }.get(provider, provider)
+
+
+def get_default_model(provider):
+    if is_gemini_provider(provider):
+        return GEMINI_DEFAULT_MODEL
+    if provider == "ollama-local":
+        return OLLAMA_DEFAULT_MODEL
+    return None
+
+
+def get_default_audio_model(provider):
+    return GEMINI_DEFAULT_AUDIO_MODEL if is_gemini_provider(provider) else None
+
+
+def get_default_base_url(provider):
+    if provider == "ollama-cloud":
+        return "https://ollama.com"
+    if provider == "ollama-local":
+        return os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+    return None
+
+
+def extract_ollama_model_names(response):
+    """Extract model names from Ollama list() responses."""
+    models = (
+        response.get("models", [])
+        if isinstance(response, dict)
+        else getattr(response, "models", [])
+    )
+    names = []
+    for model in models:
+        if isinstance(model, dict):
+            name = model.get("model") or model.get("name")
+        else:
+            name = getattr(model, "model", None) or getattr(model, "name", None)
+        if name:
+            names.append(name)
+    return names
+
+
+def extract_ollama_chunk_text(chunk):
+    """Extract streamed text content from Ollama chat responses."""
+    if isinstance(chunk, dict):
+        return (chunk.get("message") or {}).get("content", "") or chunk.get(
+            "response", ""
+        )
+
+    message = getattr(chunk, "message", None)
+    if message is not None:
+        if isinstance(message, dict):
+            return message.get("content", "") or ""
+        return getattr(message, "content", "") or ""
+
+    response_text = getattr(chunk, "response", None)
+    return response_text or ""
+
+
+def load_dotenv_file(env_path):
+    """Load simple KEY=VALUE pairs from a .env file without overriding real env vars."""
+    loaded = False
+
+    if not env_path.exists() or not env_path.is_file():
+        return loaded
+
+    try:
+        with open(env_path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+
+                if key and key not in os.environ:
+                    os.environ[key] = value
+                    loaded = True
+    except Exception as e:
+        logging.warning(f"Failed to load {env_path}: {e}")
+
+    return loaded
+
+
+def mask_secret(value):
+    """Return a masked representation of a secret value."""
+    if not value:
+        return "not set"
+    if len(value) <= 6:
+        return "*" * len(value)
+    return f"{value[:3]}...{value[-3:]}"
+
+
+def is_configured_model_available(configured_model, available_models):
+    """Check whether a configured model matches an available model entry."""
+    if not configured_model:
+        return False
+
+    for available_model in available_models:
+        if available_model == configured_model:
+            return True
+        if available_model.startswith(f"{configured_model}:"):
+            return True
+        if configured_model.startswith(f"{available_model}:"):
+            return True
+
+    return False
+
+
+def get_available_model_names(client, provider):
+    """Return model names visible to the current provider client."""
+    if is_gemini_provider(provider):
+        return [model.name for model in client.models.list()]
+    return extract_ollama_model_names(client.list())
+
+
+def test_provider_roundtrip(client, provider, model_name):
+    """Run a minimal API call against the configured provider/model."""
+    if is_gemini_provider(provider):
+        response = client.models.generate_content(
+            model=model_name,
+            contents="Reply with exactly OK.",
+            config=types.GenerateContentConfig(
+                temperature=0,
+                max_output_tokens=8,
+            ),
+        )
+        return (response.text or "").strip()
+
+    response = client.chat(
+        model=model_name,
+        messages=[{"role": "user", "content": "Reply with exactly OK."}],
+        options={"temperature": 0, "num_predict": 8},
+    )
+    return extract_ollama_chunk_text(response).strip()
+
+
+def check_command_version(command):
+    """Check whether a CLI tool is available and return a short status string."""
+    try:
+        version_flag = "-version" if command == "ffmpeg" else "--version"
+        result = subprocess.run(
+            [command, version_flag], capture_output=True, text=True, encoding="utf-8"
+        )
+        if result.returncode == 0:
+            output = (result.stdout or result.stderr or "").strip().splitlines()
+            return True, output[0] if output else "OK"
+        return False, (result.stderr or result.stdout or "failed").strip()
+    except FileNotFoundError:
+        return False, "not found"
+    except Exception as e:
+        return False, str(e)
+
+
+def print_subtitle_track_report(mkv_path):
+    """Print subtitle track metadata for a single MKV file."""
+    print("\nSubtitle tracks:")
+
+    try:
+        result = subprocess.run(
+            ["mkvmerge", "-J", str(mkv_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        mkv_info = json.loads(result.stdout)
+        subtitle_tracks = [
+            track
+            for track in mkv_info.get("tracks", [])
+            if track.get("type") == "subtitles"
+        ]
+
+        if not subtitle_tracks:
+            print("  No subtitle tracks found.")
+            return True
+
+        for track in subtitle_tracks:
+            props = track.get("properties", {})
+            track_id = track.get("id")
+            lang = props.get("language") or "unknown"
+            name = props.get("track_name") or "(no name)"
+            codec = props.get("codec_id") or "unknown"
+            default_flag = props.get("default_track", False)
+            forced_flag = props.get("forced_track", False)
+
+            print(
+                f"  - id={track_id} lang={lang} codec={codec} default={default_flag} forced={forced_flag} name={name}"
+            )
+
+        return True
+    except Exception as e:
+        print(f"  Failed to inspect subtitle tracks: {e}")
+        return False
+
+
+def run_doctor(
+    args, api_manager=None, client=None, init_error=None, dotenv_loaded=False
+):
+    """Print runtime configuration and perform basic provider/tool health checks."""
+    provider_name = get_provider_display_name(args.provider)
+    api_key_value = args.api_key
+    if not api_key_value:
+        if is_gemini_provider(args.provider):
+            api_key_value = os.environ.get("GEMINI_API_KEY") or os.environ.get(
+                "GOOGLE_API_KEY"
+            )
+        elif args.provider == "ollama-cloud":
+            api_key_value = os.environ.get("OLLAMA_API_KEY")
+
+    effective_base_url = (
+        api_manager.base_url
+        if api_manager is not None
+        else args.base_url
+        or os.environ.get("LLM_BASE_URL")
+        or get_default_base_url(args.provider)
+    )
+
+    print("=== mkv-translator doctor ===")
+    print(f"Provider: {provider_name}")
+    print(f"Model: {args.model or '(not set)'}")
+    print(f"Audio model: {args.audio_model or '(not set)'}")
+    print(f"Base URL: {effective_base_url or '(n/a)'}")
+    print(f"Primary API key: {mask_secret(api_key_value)}")
+    print(f"Secondary API key: {mask_secret(args.api_key2)}")
+    print(f".env loaded: {'yes' if dotenv_loaded else 'no'}")
+    print(f"Working directory: {Path.cwd()}")
+
+    mkvmerge_ok, mkvmerge_info = check_command_version("mkvmerge")
+    mkvextract_ok, mkvextract_info = check_command_version("mkvextract")
+    ffmpeg_ok, ffmpeg_info = check_command_version("ffmpeg")
+
+    print("\nTools:")
+    print(f"  mkvmerge: {'OK' if mkvmerge_ok else 'FAIL'} - {mkvmerge_info}")
+    print(f"  mkvextract: {'OK' if mkvextract_ok else 'FAIL'} - {mkvextract_info}")
+    print(f"  ffmpeg: {'OK' if ffmpeg_ok else 'FAIL'} - {ffmpeg_info}")
+
+    available_models = []
+    provider_ok = init_error is None and client is not None
+
+    print("\nProvider checks:")
+    if not provider_ok:
+        print(f"  Client init: FAIL - {init_error}")
+    else:
+        print("  Client init: OK")
+        try:
+            available_models = get_available_model_names(client, args.provider)
+            print(f"  Model listing: OK - {len(available_models)} models visible")
+            if available_models:
+                preview = ", ".join(available_models[:10])
+                suffix = " ..." if len(available_models) > 10 else ""
+                print(f"  Model preview: {preview}{suffix}")
+        except Exception as e:
+            print(f"  Model listing: FAIL - {e}")
+
+        if args.model:
+            model_available = is_configured_model_available(
+                args.model, available_models
+            )
+            availability_text = "yes" if model_available else "no/unknown"
+            print(f"  Configured model visible: {availability_text}")
+
+            try:
+                roundtrip_text = test_provider_roundtrip(
+                    client, args.provider, args.model
+                )
+                print(f"  API roundtrip: OK - {roundtrip_text or '(empty text)'}")
+            except Exception as e:
+                print(f"  API roundtrip: FAIL - {e}")
+                provider_ok = False
+
+    if (
+        args.input_path
+        and args.input_path.is_file()
+        and args.input_path.suffix == ".mkv"
+    ):
+        tracks_ok = print_subtitle_track_report(args.input_path)
+    else:
+        tracks_ok = True
+        if args.input_path:
+            print(
+                "\nSubtitle tracks: skipped (provide a single .mkv file to inspect tracks)"
+            )
+
+    overall_ok = mkvmerge_ok and mkvextract_ok and provider_ok and tracks_ok
+    print(f"\nOverall status: {'OK' if overall_ok else 'FAIL'}")
+    return overall_ok
+
+
+def resolve_mkv_input_files(input_path):
+    """Resolve a file or directory input into a list of MKV files."""
+    if not input_path:
+        raise ValueError("You must provide a path to an .mkv file or directory.")
+
+    if input_path.is_file():
+        if input_path.suffix == ".mkv":
+            logging.debug(f"Processing single file: {input_path.resolve()}")
+            return [input_path]
+        raise ValueError(f"File must be an .mkv file: {input_path}")
+
+    if input_path.is_dir():
+        logger.info(f"Searching for .mkv files in: {input_path.resolve()}")
+        return sorted(list(input_path.glob("*.mkv")))
+
+    raise ValueError(f"Path does not exist: {input_path}")
+
+
+def is_permanent_ollama_error(error_msg):
+    """Detect non-retryable Ollama errors that should fail fast."""
+    lower_msg = error_msg.lower()
+
+    auth_markers = [
+        "unauthorized",
+        "forbidden",
+        "authentication",
+        "invalid api key",
+        "permission denied",
+    ]
+    request_markers = ["bad request", "unsupported format", "invalid format"]
+    missing_model = "model" in lower_msg and (
+        "not found" in lower_msg
+        or "does not exist" in lower_msg
+        or "no such" in lower_msg
+        or "pull" in lower_msg
+    )
+
+    return (
+        any(marker in lower_msg for marker in auth_markers)
+        or any(marker in lower_msg for marker in request_markers)
+        or missing_model
+    )
+
 
 class APIManager:
     """
@@ -50,28 +413,50 @@ class APIManager:
     Matches gemini-srt-translator's _switch_api and _get_client pattern.
     """
 
-    def __init__(self, api_key, api_key2=None):
+    def __init__(self, provider, api_key=None, api_key2=None, base_url=None):
         """
         Initialize API manager with primary and optional secondary API key.
 
         Args:
+            provider: Provider name (gemini, ollama-local, ollama-cloud)
             api_key: Primary API key
             api_key2: Secondary API key (optional, for quota failover)
         """
+        self.provider = provider
         self.api_key = api_key
         self.api_key2 = api_key2
         self.current_api_key = api_key
         self.current_api_number = 1
         self.backup_api_number = 2
+        self.base_url = base_url or get_default_base_url(provider)
 
     def get_client(self):
         """
-        Create and return a Gemini client using the currently active API key.
+        Create and return a client using the currently active provider config.
 
         Returns:
-            genai.Client: Client configured with current API key
+            Provider client configured with current settings
         """
-        return genai.Client(api_key=self.current_api_key)
+        if is_gemini_provider(self.provider):
+            if genai is None:
+                raise ImportError(
+                    "google-genai is not installed. Run: pip install -r requirements.txt"
+                )
+            return genai.Client(api_key=self.current_api_key)
+
+        if is_ollama_provider(self.provider):
+            if OllamaClient is None:
+                raise ImportError(
+                    "ollama is not installed. Run: pip install -r requirements.txt"
+                )
+
+            headers = None
+            if self.current_api_key:
+                headers = {"Authorization": f"Bearer {self.current_api_key}"}
+
+            return OllamaClient(host=self.base_url, headers=headers)
+
+        raise ValueError(f"Unsupported provider: {self.provider}")
 
     def switch_api(self):
         """
@@ -527,12 +912,148 @@ def check_mkvtoolnix():
         return False
 
 
-def select_subtitle_track(tracks, remembered_lang=None):
-    """
-    Identifies English, German, Japanese, and French subtitle tracks.
-    If a language has been previously selected, it defaults to that.
-    Otherwise, prompts the user for selection if multiple are present.
-    """
+SUPPORTED_SUBTITLE_CODECS = {
+    "S_TEXT/ASS": ".ass",
+    "S_TEXT/SSA": ".ssa",
+    "S_TEXT/UTF8": ".srt",
+}
+
+
+def prompt_yes_no(prompt, default=False):
+    """Prompt the user for a yes/no answer."""
+    default_text = "Y/n" if default else "y/N"
+
+    while True:
+        choice = input(f"{prompt} [{default_text}]: ").strip().lower()
+        if not choice:
+            return default
+        if choice in {"y", "yes", "s", "si"}:
+            return True
+        if choice in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def prompt_subtitle_language(
+    found_tracks, prompt_text, default_lang=None, exclude=None
+):
+    """Prompt the user to choose a subtitle language from discovered tracks."""
+    exclude = exclude or set()
+    lang_options = [lang for lang in found_tracks.keys() if lang not in exclude]
+
+    if not lang_options:
+        return None
+
+    if default_lang not in lang_options:
+        default_lang = lang_options[0]
+
+    while True:
+        choice = (
+            input(
+                f"{prompt_text} ({'/'.join(lang_options)}) [default: {default_lang}]: "
+            )
+            .strip()
+            .lower()
+        )
+
+        if not choice:
+            choice = default_lang
+
+        if choice in lang_options:
+            return choice
+
+        print(f"Invalid choice. Please enter one of: {', '.join(lang_options)}.")
+
+
+def get_track_display_name(track):
+    """Build a short human-readable label for a subtitle track."""
+    props = track.get("properties", {})
+    codec = props.get("codec_id") or "unknown"
+    name = props.get("track_name") or "(no name)"
+    default_flag = props.get("default_track", False)
+    forced_flag = props.get("forced_track", False)
+    supported = codec in SUPPORTED_SUBTITLE_CODECS
+
+    flags = []
+    if default_flag:
+        flags.append("default")
+    if forced_flag:
+        flags.append("forced")
+    flags.append("supported" if supported else "unsupported")
+
+    return f"id={track.get('id')} codec={codec} name={name} flags={','.join(flags)}"
+
+
+def choose_track_for_language(lang_code, lang_tracks):
+    """Choose a specific track within one language bucket."""
+    if not lang_tracks:
+        return None
+
+    supported_tracks = [
+        track
+        for track in lang_tracks
+        if track.get("properties", {}).get("codec_id") in SUPPORTED_SUBTITLE_CODECS
+    ]
+
+    if len(lang_tracks) == 1:
+        only_track = lang_tracks[0]
+        codec = only_track.get("properties", {}).get("codec_id")
+        if codec not in SUPPORTED_SUBTITLE_CODECS:
+            logger.warning(
+                f"The only '{lang_code}' subtitle track is unsupported ({codec})."
+            )
+            return None
+        return only_track
+
+    print(f"Found multiple '{lang_code}' subtitle tracks:")
+    for idx, track in enumerate(lang_tracks, start=1):
+        print(f"  {idx}. {get_track_display_name(track)}")
+
+    default_track = supported_tracks[0] if supported_tracks else lang_tracks[0]
+    default_choice = str(lang_tracks.index(default_track) + 1)
+
+    while True:
+        choice = input(
+            f"Select {lang_code} track number [default: {default_choice}]: "
+        ).strip()
+
+        if not choice:
+            choice = default_choice
+
+        if choice.isdigit() and 1 <= int(choice) <= len(lang_tracks):
+            selected_track = lang_tracks[int(choice) - 1]
+            codec = selected_track.get("properties", {}).get("codec_id")
+            if codec not in SUPPORTED_SUBTITLE_CODECS:
+                print(
+                    "That track format is not supported for translation. Choose another."
+                )
+                continue
+            return selected_track
+
+        print(
+            f"Invalid choice. Please enter a number between 1 and {len(lang_tracks)}."
+        )
+
+
+def get_supported_language_options(found_tracks, exclude=None):
+    """Return languages that have at least one supported subtitle track."""
+    exclude = exclude or set()
+    supported_langs = []
+
+    for lang, lang_tracks in found_tracks.items():
+        if lang in exclude:
+            continue
+        if any(
+            track.get("properties", {}).get("codec_id") in SUPPORTED_SUBTITLE_CODECS
+            for track in lang_tracks
+        ):
+            supported_langs.append(lang)
+
+    return supported_langs
+
+
+def build_found_subtitle_tracks(tracks):
+    """Group recognized subtitle tracks by language bucket."""
     track_map = {"eng": [], "de": [], "ja": [], "fr": []}
 
     for track in tracks:
@@ -547,43 +1068,193 @@ def select_subtitle_track(tracks, remembered_lang=None):
             elif lang in ["fr", "fre", "fra"]:
                 track_map["fr"].append(track)
 
-    found_tracks = {lang: tracks for lang, tracks in track_map.items() if tracks}
+    return {lang: lang_tracks for lang, lang_tracks in track_map.items() if lang_tracks}
 
-    if remembered_lang and remembered_lang in found_tracks:
-        logger.info(
-            f"Automatically selecting {remembered_lang} based on previous choice."
-        )
-        return found_tracks[remembered_lang][0], remembered_lang
 
+def select_original_injection_track(tracks, remembered_lang=None):
+    """Select one source subtitle track to inject as {Original: ...}."""
+    found_tracks = build_found_subtitle_tracks(tracks)
     if not found_tracks:
         return None, None
 
-    if len(found_tracks) == 1:
-        lang = list(found_tracks.keys())[0]
-        logging.debug(f"Found single subtitle track: {lang}.")
-        return found_tracks[lang][0], lang
+    supported_langs = get_supported_language_options(found_tracks)
+    if not supported_langs:
+        logger.warning(
+            "No supported text subtitle tracks found for original injection."
+        )
+        return None, None
 
-    # Multiple tracks found, prompt user
-    lang_options = list(found_tracks.keys())
-    print(f"Found multiple subtitle languages: {', '.join(lang_options)}")
-    while True:
-        default_lang = "eng" if "eng" in lang_options else lang_options[0]
-        choice = (
-            input(
-                f"Select language to process ({'/'.join(lang_options)}) [default: {default_lang}]: "
-            )
-            .strip()
-            .lower()
+    if remembered_lang in supported_langs:
+        lang_code = remembered_lang
+        logger.info(
+            f"Automatically selecting original-comment language {lang_code} based on previous choice."
+        )
+    elif len(supported_langs) == 1:
+        lang_code = supported_langs[0]
+    else:
+        default_lang = "eng" if "eng" in supported_langs else supported_langs[0]
+        print(
+            f"Available languages for Original injection: {', '.join(supported_langs)}"
+        )
+        lang_code = prompt_subtitle_language(
+            found_tracks,
+            "Select language to inject as Original",
+            default_lang=default_lang,
+            exclude={lang for lang in found_tracks if lang not in supported_langs},
         )
 
-        if not choice:
-            choice = default_lang
+    track = choose_track_for_language(lang_code, found_tracks[lang_code])
+    if track is None:
+        return None, None
 
-        if choice in lang_options:
-            logger.info(f"User selected {choice}.")
-            return found_tracks[choice][0], choice
+    return track, lang_code
 
-        print(f"Invalid choice. Please enter one of: {', '.join(lang_options)}.")
+
+def select_subtitle_tracks(
+    tracks, remembered_lang=None, remembered_secondary_lang=None
+):
+    """
+    Select primary subtitle language and optional secondary context language.
+    """
+    found_tracks = build_found_subtitle_tracks(tracks)
+
+    if not found_tracks:
+        return None, None, None, None
+
+    if remembered_lang and remembered_lang in found_tracks:
+        primary_lang = remembered_lang
+        logger.info(
+            f"Automatically selecting {remembered_lang} based on previous choice."
+        )
+    elif len(found_tracks) == 1:
+        primary_lang = list(found_tracks.keys())[0]
+        logging.debug(f"Found single subtitle track: {primary_lang}.")
+    else:
+        print(f"Found multiple subtitle languages: {', '.join(found_tracks.keys())}")
+        primary_default = (
+            "fr"
+            if "fr" in found_tracks
+            else ("eng" if "eng" in found_tracks else list(found_tracks.keys())[0])
+        )
+        primary_lang = prompt_subtitle_language(
+            found_tracks,
+            "Select primary language to translate from",
+            default_lang=primary_default,
+        )
+        logger.info(f"User selected primary language {primary_lang}.")
+
+    primary_track = choose_track_for_language(primary_lang, found_tracks[primary_lang])
+    if primary_track is None:
+        supported_primary_langs = get_supported_language_options(found_tracks)
+        fallback_langs = [
+            lang for lang in supported_primary_langs if lang != primary_lang
+        ]
+
+        if fallback_langs:
+            logger.warning(
+                f"Primary language '{primary_lang}' has no supported text subtitle track. Choose another language."
+            )
+            primary_lang = prompt_subtitle_language(
+                found_tracks,
+                "Select primary language to translate from",
+                default_lang=fallback_langs[0],
+                exclude={lang for lang in found_tracks if lang not in fallback_langs},
+            )
+            primary_track = choose_track_for_language(
+                primary_lang, found_tracks[primary_lang]
+            )
+
+    if primary_track is None:
+        return None, None, None, None
+
+    secondary_lang = None
+    secondary_track = None
+    remaining_langs = [lang for lang in found_tracks.keys() if lang != primary_lang]
+
+    if remaining_langs:
+        if remembered_secondary_lang and remembered_secondary_lang in remaining_langs:
+            secondary_lang = remembered_secondary_lang
+            logger.info(
+                f"Automatically selecting secondary language {secondary_lang} based on previous choice."
+            )
+        else:
+            default_use_secondary = primary_lang == "fr" and "eng" in remaining_langs
+            if prompt_yes_no(
+                "Use a secondary subtitle language as translation context?",
+                default=default_use_secondary,
+            ):
+                secondary_default = (
+                    "eng" if "eng" in remaining_langs else remaining_langs[0]
+                )
+                secondary_lang = prompt_subtitle_language(
+                    found_tracks,
+                    "Select secondary context language",
+                    default_lang=secondary_default,
+                    exclude={primary_lang},
+                )
+                logger.info(
+                    f"User selected secondary context language {secondary_lang}."
+                )
+
+        if secondary_lang:
+            secondary_track = choose_track_for_language(
+                secondary_lang, found_tracks[secondary_lang]
+            )
+            if secondary_track is None:
+                logger.warning(
+                    f"Secondary language '{secondary_lang}' has no supported text subtitle track. Skipping secondary context."
+                )
+                secondary_lang = None
+
+    return primary_track, primary_lang, secondary_track, secondary_lang
+
+
+def extract_subtitle_track(mkv_path, track, tmp_dir, lang_code, label=""):
+    """Extract a specific subtitle track from an MKV file."""
+    codec_id = track.get("properties", {}).get("codec_id")
+    if codec_id not in SUPPORTED_SUBTITLE_CODECS:
+        logger.warning(f"Unsupported subtitle format '{codec_id}' in {mkv_path.name}.")
+        return None, None
+
+    subtitle_extension = SUPPORTED_SUBTITLE_CODECS[codec_id]
+    suffix = f".{label}" if label else ""
+    extracted_subtitle_path = (
+        tmp_dir / f"{mkv_path.stem}.{lang_code}{suffix}{subtitle_extension}"
+    )
+    subtitle_track_id = track["id"]
+
+    mkvextract_cmd = [
+        "mkvextract",
+        "tracks",
+        str(mkv_path),
+        f"{subtitle_track_id}:{extracted_subtitle_path}",
+    ]
+    logging.debug(
+        f"Extracting track {subtitle_track_id} ({lang_code}, {codec_id}) to: {extracted_subtitle_path}"
+    )
+
+    result = subprocess.run(
+        mkvextract_cmd, capture_output=True, text=True, encoding="utf-8"
+    )
+
+    if (
+        "Error in the Matroska file structure" in result.stdout
+        or "Resync failed" in result.stdout
+    ):
+        logger.warning(f"MKV file {mkv_path.name} appears to be corrupted. Skipping.")
+        if extracted_subtitle_path.is_file():
+            extracted_subtitle_path.unlink()
+        return None, None
+
+    if (
+        not extracted_subtitle_path.is_file()
+        or extracted_subtitle_path.stat().st_size == 0
+    ):
+        logger.error(f"Extraction failed for {mkv_path.name}")
+        return None, None
+
+    logging.debug(f"Successfully extracted subtitle track to {extracted_subtitle_path}")
+    return extracted_subtitle_path, subtitle_extension
 
 
 # --- Progress Management Functions ---
@@ -707,6 +1378,7 @@ def get_system_instruction(
     thinking=True,
     audio_file=None,
     gender_hints=False,
+    reference_lang=None,
 ):
     """
     Generate system instruction for translation.
@@ -735,15 +1407,30 @@ def get_system_instruction(
                 "- gender_confidence: optional hint (low/medium/high)",
             ]
         )
+    if reference_lang:
+        fields.extend(
+            [
+                f"- reference_content: optional aligned subtitle text in {reference_lang}",
+            ]
+        )
     fields_text = "\n".join(fields) + "\n"
 
     instruction = f"""You are an assistant that translates subtitles from {source_lang} to {target_lang}.
 
 You will receive a list of objects, each with these fields:
 {fields_text}
-Translate the 'content' field of each object.
+Treat the full batch as one continuous scene: infer context across neighboring lines first, then write the final translation for each object.
+Translate the 'content' field of each object into natural {target_lang}.
 If the 'content' field is empty, leave it as is.
 Preserve line breaks, formatting, and special characters.
+Keep the same segmentation: think with full-scene context, but return one translated line per original object.
+Never leave dialogue in {source_lang} unless the text is already a proper noun, a deliberate loanword, or an expression that should remain unchanged in Spanish.
+When the main source line contains gendered wording or pronoun cues, preserve that gender in Spanish.
+Prefer gender/person cues from the main {source_lang} line over any auxiliary reference.
+Maintain gender continuity across neighboring lines when they appear to belong to the same speaker or same conversational thread.
+If nearby context in the main {source_lang} subtitles establishes a feminine speaker/addressee, keep feminine agreement in later ambiguous lines unless the main source clearly changes it.
+Do not default to masculine just because a later line is ambiguous.
+If gender is truly uncertain, prefer a neutral Spanish rephrase over forcing masculine agreement.
 Do NOT move or merge 'content' between objects.
 Do NOT add or remove any objects.
 Do NOT alter the 'index' field."""
@@ -777,6 +1464,19 @@ Use them as guidance for grammatical agreement in {target_lang}:
 - gender_confidence tells you how strongly to trust the hints
 - If a hint is unknown or low confidence, rely on dialogue context or prefer neutral wording when natural"""
 
+    if reference_lang:
+        instruction += f"""
+
+Some objects may include reference_content from an aligned {reference_lang} subtitle track.
+Use it as a semantic cross-check to confirm meaning, speaker intent, names, and ambiguous lines.
+If the main line in {source_lang} seems underspecified, use reference_content to understand the scene before translating.
+Do not copy reference_content literally unless that is also the correct meaning in Spanish.
+Do not let reference_content override explicit gender, pronoun, or speaker-role cues already present in the main {source_lang} line.
+Do not let reference_content push an ambiguous line toward masculine if the main {source_lang} scene context was already feminine.
+Always prioritize the main {source_lang} content when there is a conflict.
+Before finalizing the batch, mentally verify each translation against reference_content and the surrounding batch context.
+Do not translate the reference_content field itself into the output."""
+
     instruction += thinking_instruction
 
     return instruction
@@ -800,9 +1500,7 @@ def get_safety_settings():
     ]
 
 
-def get_audio_analysis_instruction(
-    source_lang, target_lang="Latin American Spanish"
-):
+def get_audio_analysis_instruction(source_lang, target_lang="Latin American Spanish"):
     """Build system instruction for audio-only gender analysis fallback."""
     return f"""You analyze subtitle-timed dialogue audio to provide grammatical gender hints for translation from {source_lang} to {target_lang}.
 
@@ -872,6 +1570,7 @@ def get_translation_config(
     temperature=None,
     top_p=None,
     top_k=None,
+    provider="gemini",
 ):
     """
     Build API configuration.
@@ -886,46 +1585,72 @@ def get_translation_config(
         top_p: Nucleus sampling parameter (0.0-1.0)
         top_k: Top-K sampling parameter (integer >= 0)
     """
-    # Response schema: array of {index, content} objects
-    response_schema = types.Schema(
-        type=types.Type.ARRAY,
-        items=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "index": types.Schema(type=types.Type.STRING),
-                "content": types.Schema(type=types.Type.STRING),
-            },
-            required=["index", "content"],
-        ),
-    )
-
-    # Determine thinking mode compatibility
-    # Supports: Gemini 2.0, 2.5, and 3.x models
-    thinking_compatible = (
-        "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
-    )
-    thinking_budget_compatible = "flash" in model_name
-
-    # Build thinking config if compatible
-    # Flash models: Use thinking_budget for controlled thinking
-    # Pro models: Enable thinking without budget (handled by timeout/retry mechanism)
-    thinking_config = None
-    if thinking_compatible and thinking:
-        thinking_config = types.ThinkingConfig(
-            include_thoughts=True,
-            thinking_budget=thinking_budget if thinking_budget_compatible else None,
+    if is_gemini_provider(provider):
+        # Response schema: array of {index, content} objects
+        response_schema = types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "index": types.Schema(type=types.Type.STRING),
+                    "content": types.Schema(type=types.Type.STRING),
+                },
+                required=["index", "content"],
+            ),
         )
 
-    return types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=response_schema,
-        safety_settings=get_safety_settings(),
-        system_instruction=system_instruction,
-        thinking_config=thinking_config,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=top_k,
-    )
+        # Determine thinking mode compatibility
+        # Supports: Gemini 2.0, 2.5, and 3.x models
+        thinking_compatible = (
+            "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
+        )
+        thinking_budget_compatible = "flash" in model_name
+
+        # Build thinking config if compatible
+        # Flash models: Use thinking_budget for controlled thinking
+        # Pro models: Enable thinking without budget (handled by timeout/retry mechanism)
+        thinking_config = None
+        if thinking_compatible and thinking:
+            thinking_config = types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget=thinking_budget if thinking_budget_compatible else None,
+            )
+
+        return types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            safety_settings=get_safety_settings(),
+            system_instruction=system_instruction,
+            thinking_config=thinking_config,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+    return {
+        "provider": provider,
+        "system_instruction": system_instruction,
+        "format": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["index", "content"],
+            },
+        },
+        "options": {
+            key: value
+            for key, value in {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            }.items()
+            if value is not None
+        },
+    }
 
 
 def is_rtl(text):
@@ -996,11 +1721,14 @@ def is_primarily_latin(text):
     return latin_count > other_count
 
 
-def validate_batch_tokens(client, batch, model_name):
+def validate_batch_tokens(client, batch, model_name, provider="gemini"):
     """
     Validate batch doesn't exceed token limit.
     Uses actual model limits based on Gemini model specifications.
     """
+    if not is_gemini_provider(provider):
+        return True
+
     try:
         # Use the ACTUAL model for token counting
         token_count = client.models.count_tokens(
@@ -1051,7 +1779,14 @@ def prompt_new_batch_size(current_size):
             return current_size // 2  # Default to half
 
 
-def build_resume_context(dialogue_lines, translated_subtitle, start_line, batch_size):
+def build_resume_context(
+    dialogue_lines,
+    translated_subtitle,
+    start_line,
+    batch_size,
+    provider="gemini",
+    reference_contexts=None,
+):
     """
     Build conversation context when resuming.
     Provides continuity for translation consistency.
@@ -1067,16 +1802,27 @@ def build_resume_context(dialogue_lines, translated_subtitle, start_line, batch_
         return []
 
     # Build original batch
-    original_batch = [
-        {"index": str(i), "content": dialogue_lines[i]}
-        for i in range(context_start, context_end)
-    ]
+    original_batch = []
+    for i in range(context_start, context_end):
+        item = {"index": str(i), "content": dialogue_lines[i]}
+        if reference_contexts and reference_contexts.get(i):
+            item["reference_content"] = reference_contexts[i]
+        original_batch.append(item)
 
     # Build translated batch
     translated_batch = [
         {"index": str(i), "content": translated_subtitle[i]}
         for i in range(context_start, context_end)
     ]
+
+    if is_ollama_provider(provider):
+        return [
+            {"role": "user", "content": json.dumps(original_batch, ensure_ascii=False)},
+            {
+                "role": "assistant",
+                "content": json.dumps(translated_batch, ensure_ascii=False),
+            },
+        ]
 
     return [
         types.Content(
@@ -1088,6 +1834,365 @@ def build_resume_context(dialogue_lines, translated_subtitle, start_line, batch_
             parts=[types.Part(text=json.dumps(translated_batch, ensure_ascii=False))],
         ),
     ]
+
+
+def load_reference_subtitle_entries(subtitle_path, strip_sdh=False):
+    """Load simplified dialogue entries from a secondary subtitle file."""
+    if not subtitle_path:
+        return []
+
+    normalize_ass_colors(subtitle_path)
+    subs = pysubs2.load(str(subtitle_path))
+
+    ass_header_keywords = [
+        "[Script Info]",
+        "[V4+ Styles]",
+        "[Events]",
+        "[Aegisub",
+        "Format:",
+        "Style:",
+        "ScriptType:",
+        "PlayResX:",
+        "PlayResY:",
+        "WrapStyle:",
+        "Title:",
+        "Collisions:",
+    ]
+
+    entries = []
+    for event in subs:
+        if not hasattr(event, "type") or event.type != "Dialogue":
+            continue
+
+        if (
+            r"\p1" in event.text
+            or r"\p2" in event.text
+            or r"\p3" in event.text
+            or r"\p4" in event.text
+        ):
+            continue
+
+        if any(keyword in event.text for keyword in ass_header_keywords):
+            continue
+
+        plain_text = remove_formatting(event.text)
+        if not plain_text:
+            continue
+
+        if strip_sdh:
+            plain_text = strip_sdh_elements(plain_text)
+            if not plain_text or is_sdh_only_line(plain_text):
+                continue
+
+        entries.append(
+            {
+                "start": event.start,
+                "end": event.end,
+                "content": plain_text.strip(),
+            }
+        )
+
+    return entries
+
+
+def build_reference_context_map(dialogue_events, reference_entries):
+    """Align reference subtitle entries to primary dialogue events by timing."""
+    if not reference_entries:
+        return {}
+
+    context_map = {}
+
+    for idx, event in enumerate(dialogue_events):
+        primary_start = event.start
+        primary_end = event.end
+        primary_mid = (primary_start + primary_end) / 2
+        candidates = []
+
+        for entry in reference_entries:
+            reference_start = entry["start"]
+            reference_end = entry["end"]
+            reference_mid = (reference_start + reference_end) / 2
+            overlap = min(primary_end, reference_end) - max(
+                primary_start, reference_start
+            )
+            midpoint_delta = abs(primary_mid - reference_mid)
+
+            if overlap > 0 or midpoint_delta <= 1500:
+                candidates.append((max(overlap, 0), midpoint_delta, entry["content"]))
+
+        if not candidates:
+            continue
+
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        unique_texts = []
+        for _, _, text in candidates:
+            if text and text not in unique_texts:
+                unique_texts.append(text)
+            if len(unique_texts) >= 2:
+                break
+
+        if unique_texts:
+            context_map[idx] = " | ".join(unique_texts)
+
+    return context_map
+
+
+def get_dialogue_event_signature(event):
+    """Build a stable signature for matching dialogue events across saves."""
+    return (
+        getattr(event, "start", None),
+        getattr(event, "end", None),
+        getattr(event, "style", None),
+        getattr(event, "name", None),
+        getattr(event, "layer", None),
+    )
+
+
+def strip_original_comment_prefix(text):
+    """Remove an existing leading {Original: ...} comment if present."""
+    return re.sub(r"^\{Original: .*?\}", "", text, count=1)
+
+
+def normalize_translation_comparison_text(text):
+    """Normalize text for rough source-vs-output comparison."""
+    if not text:
+        return ""
+    text = remove_formatting(text)
+    text = restore_ass_directives(text)
+    text = re.sub(r"[\W_]+", "", text.lower(), flags=re.UNICODE)
+    return text.strip()
+
+
+def has_strong_source_language_signal(text, source_lang=None):
+    """Heuristic: detect whether unchanged text still strongly looks like source language."""
+    if not text:
+        return False
+
+    stripped = text.strip()
+    lower = stripped.lower()
+
+    if re.search(r"[àâæçéèêëîïôœùûüÿ]", lower):
+        return True
+
+    if source_lang == "fr":
+        french_markers = [
+            r"\b(?:je|tu|il|elle|on|nous|vous|ils|elles)\b",
+            r"\b(?:le|la|les|un|une|des|du|de|d'|au|aux)\b",
+            r"\b(?:est|suis|es|sommes|êtes|sont|avait|avec|pour|pas|plus|que|qui)\b",
+            r"\b(?:bonjour|merci|monsieur|madame|mademoiselle|oui)\b",
+        ]
+        return any(re.search(pattern, lower) for pattern in french_markers)
+
+    if source_lang == "eng":
+        english_markers = [
+            r"\b(?:the|and|you|are|is|was|were|with|for|this|that|what|why|don't|can't)\b",
+        ]
+        return any(re.search(pattern, lower) for pattern in english_markers)
+
+    return len(stripped.split()) >= 4
+
+
+def find_suspicious_unchanged_translations(batch, translated_batch, source_lang=None):
+    """Detect lines that were returned essentially unchanged from the source."""
+    suspicious = []
+    batch_by_index = {str(item.get("index", "")): item for item in batch}
+
+    for translated_item in translated_batch:
+        item_index = str(translated_item.get("index", ""))
+        source_item = batch_by_index.get(item_index)
+        if not source_item:
+            continue
+
+        source_text = source_item.get("content", "")
+        translated_text = translated_item.get("content", "")
+
+        source_norm = normalize_translation_comparison_text(source_text)
+        translated_norm = normalize_translation_comparison_text(translated_text)
+
+        if len(source_norm) < 4 or not re.search(r"[A-Za-zÀ-ÿ]", source_text):
+            continue
+
+        # Skip probable proper nouns / titles / single-token labels that can naturally stay unchanged.
+        if " " not in source_text.strip() and not re.search(r"[.!?¿¡,:;]", source_text):
+            continue
+
+        if (
+            source_norm
+            and source_norm == translated_norm
+            and has_strong_source_language_signal(source_text, source_lang)
+        ):
+            suspicious.append(item_index or "?")
+
+    return suspicious
+
+
+def normalize_translated_batch(batch, translated_batch):
+    """Normalize model output to the expected batch order by index.
+
+    Accepts harmless extras/duplicates if every expected index is present exactly once
+    after normalization. Raises ValueError if required indices are missing or items are invalid.
+    """
+    if not isinstance(translated_batch, list):
+        raise ValueError("Model response is not a JSON array")
+
+    expected_indices = [str(item.get("index", "")) for item in batch]
+    expected_index_set = set(expected_indices)
+    normalized_map = {}
+    duplicate_indices = []
+    unexpected_indices = []
+
+    for item in translated_batch:
+        if not isinstance(item, dict):
+            raise ValueError("Model response contains a non-object item")
+
+        item_index = str(item.get("index", ""))
+        if not item_index:
+            raise ValueError("Model response contains an item without index")
+
+        if item_index not in expected_index_set:
+            unexpected_indices.append(item_index)
+            continue
+
+        if item_index in normalized_map:
+            duplicate_indices.append(item_index)
+            continue
+
+        normalized_map[item_index] = item
+
+    missing_indices = [idx for idx in expected_indices if idx not in normalized_map]
+    if missing_indices:
+        raise ValueError(
+            f"Response missing expected indices: {', '.join(missing_indices[:8])}"
+        )
+
+    if unexpected_indices:
+        logger.log_only(
+            f"Ignoring unexpected response indices: {', '.join(unexpected_indices[:8])}"
+        )
+    if duplicate_indices:
+        logger.log_only(
+            f"Ignoring duplicate response indices: {', '.join(duplicate_indices[:8])}"
+        )
+
+    return [normalized_map[idx] for idx in expected_indices]
+
+
+def inject_original_comments_into_ass(translated_ass_path, reference_subtitle_path):
+    """Inject {Original: ...} comments into an existing translated ASS file."""
+    if translated_ass_path.suffix.lower() != ".ass":
+        logger.warning(
+            f"Skipping {translated_ass_path.name}: Original comments are only supported for ASS output."
+        )
+        return False
+
+    translated_subs = pysubs2.load(str(translated_ass_path))
+    translated_events = [
+        event
+        for event in translated_subs
+        if hasattr(event, "type") and event.type == "Dialogue"
+    ]
+    if not translated_events:
+        logger.warning(f"No Dialogue events found in {translated_ass_path.name}.")
+        return False
+
+    reference_entries = load_reference_subtitle_entries(reference_subtitle_path)
+    reference_contexts = build_reference_context_map(
+        translated_events, reference_entries
+    )
+    if not reference_contexts:
+        logger.warning(
+            f"No aligned source lines found to inject into {translated_ass_path.name}."
+        )
+        return False
+
+    updated_count = 0
+    for idx, event in enumerate(translated_events):
+        original_text = reference_contexts.get(idx)
+        if not original_text:
+            continue
+
+        cleaned_text = strip_original_comment_prefix(event.text)
+        event.text = f"{{Original: {original_text}}}{cleaned_text}"
+        updated_count += 1
+
+    translated_subs.save(str(translated_ass_path))
+    logger.success(
+        f"Added Original comments to {updated_count} dialogue lines in {translated_ass_path.name}"
+    )
+    return True
+
+
+def find_translated_subtitle_for_mkv(output_dir, mkv_stem):
+    """Find the translated subtitle file corresponding to an MKV stem."""
+    candidates = [
+        output_dir / f"{mkv_stem}.es-419.ass",
+        output_dir / f"{mkv_stem}.es-419.ssa",
+        output_dir / f"{mkv_stem}.es-419.srt",
+    ]
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def add_original_comments_to_existing_output(
+    mkv_path, output_dir, remembered_lang=None
+):
+    """Post-process an existing translated subtitle/MKV to add {Original: ...} comments."""
+    translated_subtitle_path = find_translated_subtitle_for_mkv(
+        output_dir, mkv_path.stem
+    )
+    if not translated_subtitle_path:
+        logger.warning(
+            f"No translated subtitle file found for {mkv_path.name} in {output_dir}."
+        )
+        return None
+
+    if translated_subtitle_path.suffix.lower() != ".ass":
+        logger.warning(
+            f"Found {translated_subtitle_path.name}, but Original comments only work with ASS output."
+        )
+        return None
+
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
+
+    try:
+        result = subprocess.run(
+            ["mkvmerge", "-J", str(mkv_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        mkv_info = json.loads(result.stdout)
+        selected_track, lang_code = select_original_injection_track(
+            mkv_info.get("tracks", []), remembered_lang
+        )
+        if selected_track is None:
+            logger.warning(
+                f"No suitable subtitle track found to inject as Original in {mkv_path.name}."
+            )
+            return None
+
+        reference_subtitle_path, _ = extract_subtitle_track(
+            mkv_path, selected_track, tmp_dir, lang_code, label="original"
+        )
+        if not reference_subtitle_path:
+            return None
+
+        updated = inject_original_comments_into_ass(
+            translated_subtitle_path, reference_subtitle_path
+        )
+        if not updated:
+            return None
+
+        merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_dir)
+        return lang_code
+    except Exception as e:
+        logger.error(f"Failed to add Original comments for {mkv_path.name}: {e}")
+        return None
 
 
 def is_audio_capability_error(error_msg):
@@ -1163,9 +2268,7 @@ def analyze_audio_batch(
                     f"Audio analysis still running with {audio_model_name}... {elapsed}s elapsed"
                 )
 
-    heartbeat_thread = threading.Thread(
-        target=audio_analysis_heartbeat, daemon=True
-    )
+    heartbeat_thread = threading.Thread(target=audio_analysis_heartbeat, daemon=True)
     heartbeat_thread.start()
 
     try:
@@ -1249,11 +2352,16 @@ def probe_audio_input_support(client, model_name, sample_batch, audio_part):
     contents = [
         types.Content(
             role="user",
-            parts=[types.Part(text=json.dumps(sample_batch, ensure_ascii=False)), audio_part],
+            parts=[
+                types.Part(text=json.dumps(sample_batch, ensure_ascii=False)),
+                audio_part,
+            ],
         )
     ]
     with suppress_stderr_output():
-        client.models.generate_content(model=model_name, contents=contents, config=config)
+        client.models.generate_content(
+            model=model_name, contents=contents, config=config
+        )
 
 
 def attach_gender_hints_to_batch(batch, hints_by_index=None):
@@ -1261,7 +2369,7 @@ def attach_gender_hints_to_batch(batch, hints_by_index=None):
     request_batch = []
 
     for item in batch:
-        request_item = {"index": item["index"], "content": item["content"]}
+        request_item = dict(item)
         if hints_by_index:
             hints = hints_by_index.get(str(item["index"]))
             if hints:
@@ -1284,6 +2392,201 @@ def get_last_chunk_size():
     return _last_chunk_size
 
 
+def process_batch_streaming_ollama(
+    client,
+    model_name,
+    batch,
+    previous_message,
+    translated_subtitle,
+    config,
+    current_line,
+    total_lines,
+    batch_number=1,
+    keep_original=False,
+    original_format=".ass",
+    audio_part=None,
+    audio_file=None,
+    dialogue_lines=None,
+    unique_text_indices=None,
+    deduplication_keys=None,
+    provider="ollama-local",
+    source_lang=None,
+):
+    """Process a translation batch using Ollama's streaming chat API."""
+    global _last_chunk_size
+    _last_chunk_size = 0
+    provider_name = get_provider_display_name(provider)
+
+    original_texts = {int(item["index"]): item["content"] for item in batch}
+    done = False
+    corrective_message = None
+    source_leak_retry_count = 0
+    max_source_leak_retries = 2
+
+    while done == False:
+        response_text = ""
+        chunk_count = 0
+
+        messages = [{"role": "system", "content": config["system_instruction"]}]
+        messages.extend(previous_message)
+        messages.append(
+            {"role": "user", "content": json.dumps(batch, ensure_ascii=False)}
+        )
+        if corrective_message:
+            messages.append({"role": "user", "content": corrective_message})
+
+        chat_kwargs = {
+            "model": model_name,
+            "messages": messages,
+            "stream": True,
+            "format": config.get("format", "json"),
+        }
+        if config.get("options"):
+            chat_kwargs["options"] = config["options"]
+
+        response = client.chat(**chat_kwargs)
+
+        for chunk in response:
+            part_text = extract_ollama_chunk_text(chunk)
+            if not part_text:
+                continue
+
+            response_text += part_text
+
+            try:
+                partial_batch = json_repair.loads(response_text)
+                if isinstance(partial_batch, list):
+                    prev_chunk_count = chunk_count
+                    chunk_count = len(partial_batch)
+
+                    for i in range(prev_chunk_count, chunk_count):
+                        if i < len(partial_batch):
+                            item = partial_batch[i]
+                            idx = int(item["index"])
+                            content = item["content"]
+
+                            if is_rtl(content):
+                                content = f"\u202b{content}\u202c"
+
+                            if keep_original and original_format == ".ass":
+                                original_text = original_texts.get(idx, "")
+                                if original_text:
+                                    content = f"{{Original: {original_text}}}{content}"
+
+                            translated_subtitle[idx] = content
+
+                            if (
+                                dialogue_lines is not None
+                                and unique_text_indices is not None
+                                and deduplication_keys is not None
+                            ):
+                                dedup_key = deduplication_keys[idx]
+                                if dedup_key in unique_text_indices:
+                                    for duplicate_idx in unique_text_indices[dedup_key]:
+                                        if duplicate_idx != idx:
+                                            translated_subtitle[duplicate_idx] = content
+
+                    _last_chunk_size = chunk_count
+                    effective_chunk = min(
+                        chunk_count, max(0, total_lines - current_line)
+                    )
+                    progress_bar(
+                        current=current_line,
+                        total=total_lines,
+                        model_name=model_name,
+                        chunk_size=effective_chunk,
+                        is_loading=True,
+                    )
+            except Exception:
+                effective_chunk = min(chunk_count, max(0, total_lines - current_line))
+                progress_bar(
+                    current=current_line,
+                    total=total_lines,
+                    model_name=model_name,
+                    chunk_size=effective_chunk,
+                    is_loading=True,
+                )
+
+        if not response_text or not response_text.strip():
+            clear_progress()
+            error_with_progress(f"{provider_name} returned an empty response.")
+            info_with_progress("Sending last batch again...")
+            continue
+
+        try:
+            translated_batch = json_repair.loads(response_text)
+        except Exception as e:
+            clear_progress()
+            warning_with_progress(f"Failed to parse response: {e}")
+            info_with_progress("Sending last batch again...")
+            continue
+
+        try:
+            translated_batch = normalize_translated_batch(batch, translated_batch)
+        except Exception as e:
+            clear_progress()
+            warning_with_progress(f"Invalid response structure: {e}")
+            info_with_progress("Sending last batch again...")
+            continue
+
+        suspicious_indices = find_suspicious_unchanged_translations(
+            batch, translated_batch, source_lang=source_lang
+        )
+        leak_threshold = max(3, (len(batch) * 8 + 99) // 100)
+        if len(suspicious_indices) >= leak_threshold:
+            if source_leak_retry_count < max_source_leak_retries:
+                source_leak_retry_count += 1
+                corrective_message = (
+                    f"Your previous answer left lines {', '.join(map(str, suspicious_indices[:8]))} effectively unchanged in {source_lang or 'the source language'}. "
+                    "Re-evaluate the whole batch using scene context and reference_content, then return only corrected Latin American Spanish JSON."
+                )
+                clear_progress()
+                warning_with_progress(
+                    "Detected source-language leakage in the batch. Retrying with stricter context review..."
+                )
+                continue
+            raise ValueError(
+                f"Persistent source language leak detected in batch lines: {', '.join(map(str, suspicious_indices[:8]))}"
+            )
+        elif suspicious_indices:
+            logger.log_only(
+                f"Minor unchanged-source warning ignored for batch: {', '.join(map(str, suspicious_indices[:8]))}"
+            )
+
+        for item in translated_batch:
+            idx = int(item["index"])
+            content = item["content"]
+
+            if is_rtl(content):
+                content = f"\u202b{content}\u202c"
+
+            if keep_original and original_format == ".ass":
+                original_text = original_texts.get(idx, "")
+                if original_text:
+                    content = f"{{Original: {original_text}}}{content}"
+
+            translated_subtitle[idx] = content
+
+            if (
+                dialogue_lines is not None
+                and unique_text_indices is not None
+                and deduplication_keys is not None
+            ):
+                dedup_key = deduplication_keys[idx]
+                if dedup_key in unique_text_indices:
+                    for duplicate_idx in unique_text_indices[dedup_key]:
+                        if duplicate_idx != idx:
+                            translated_subtitle[duplicate_idx] = content
+
+        _last_chunk_size = len(translated_batch)
+        done = True
+
+        return [
+            {"role": "user", "content": json.dumps(batch, ensure_ascii=False)},
+            {"role": "assistant", "content": response_text},
+        ]
+
+
 def process_batch_streaming(
     client,
     model_name,
@@ -1300,6 +2603,9 @@ def process_batch_streaming(
     audio_file=None,
     dialogue_lines=None,
     unique_text_indices=None,
+    deduplication_keys=None,
+    provider="gemini",
+    source_lang=None,
 ):
     """
     Process a batch with streaming responses and real-time progress display.
@@ -1312,9 +2618,32 @@ def process_batch_streaming(
     Returns:
         previous_message context for next batch
     """
+    if is_ollama_provider(provider):
+        return process_batch_streaming_ollama(
+            client=client,
+            model_name=model_name,
+            batch=batch,
+            previous_message=previous_message,
+            translated_subtitle=translated_subtitle,
+            config=config,
+            current_line=current_line,
+            total_lines=total_lines,
+            batch_number=batch_number,
+            keep_original=keep_original,
+            original_format=original_format,
+            audio_part=audio_part,
+            audio_file=audio_file,
+            dialogue_lines=dialogue_lines,
+            unique_text_indices=unique_text_indices,
+            deduplication_keys=deduplication_keys,
+            provider=provider,
+            source_lang=source_lang,
+        )
+
     global _last_chunk_size
     batch_size = len(batch)
     _last_chunk_size = 0  # Reset
+    provider_name = get_provider_display_name(provider)
 
     # Build request
     parts = [types.Part(text=json.dumps(batch, ensure_ascii=False))]
@@ -1324,9 +2653,6 @@ def process_batch_streaming(
         parts.append(audio_part)
 
     current_message = types.Content(role="user", parts=parts)
-
-    # Build full conversation
-    contents = previous_message + [current_message]
 
     # Temporarily suppress ALL logging during API call to prevent disrupting progress bar
     old_level = logging.getLogger().level
@@ -1338,6 +2664,9 @@ def process_batch_streaming(
     final_response_text = ""
     final_thoughts_text = ""
     max_retries_on_timeout = 3  # Retry up to 3 times if thinking times out
+    corrective_message = None
+    source_leak_retry_count = 0
+    max_source_leak_retries = 2
 
     # Create lookup dict for original texts (for --keep-original feature)
     original_texts = {int(item["index"]): item["content"] for item in batch}
@@ -1350,6 +2679,15 @@ def process_batch_streaming(
             chunk_count = 0
             translated_batch = []
             blocked = False
+
+            contents = previous_message + [current_message]
+            if corrective_message:
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[types.Part(text=corrective_message)],
+                    )
+                )
 
             # Timeout tracking for thinking phase
             thinking_start_time = None
@@ -1445,19 +2783,13 @@ def process_batch_streaming(
                                             if (
                                                 dialogue_lines is not None
                                                 and unique_text_indices is not None
+                                                and deduplication_keys is not None
                                             ):
-                                                original_text_content = dialogue_lines[
-                                                    idx
-                                                ].strip()
-                                                if (
-                                                    original_text_content
-                                                    in unique_text_indices
-                                                ):
+                                                dedup_key = deduplication_keys[idx]
+                                                if dedup_key in unique_text_indices:
                                                     for (
                                                         duplicate_idx
-                                                    ) in unique_text_indices[
-                                                        original_text_content
-                                                    ]:
+                                                    ) in unique_text_indices[dedup_key]:
                                                         if (
                                                             duplicate_idx != idx
                                                         ):  # Skip the one we just translated
@@ -1525,7 +2857,7 @@ def process_batch_streaming(
             # Check for empty response - retry
             if not response_text or not response_text.strip():
                 clear_progress()
-                error_with_progress("Gemini returned an empty response.")
+                error_with_progress(f"{provider_name} returned an empty response.")
                 info_with_progress("Sending last batch again...")
                 continue
 
@@ -1538,14 +2870,37 @@ def process_batch_streaming(
                 info_with_progress("Sending last batch again...")
                 continue
 
-            # Validate response length
-            if len(translated_batch) != len(batch):
+            try:
+                translated_batch = normalize_translated_batch(batch, translated_batch)
+            except Exception as e:
                 clear_progress()
-                warning_with_progress(
-                    f"Response length mismatch: expected {len(batch)}, got {len(translated_batch)}"
-                )
+                warning_with_progress(f"Invalid response structure: {e}")
                 info_with_progress("Sending last batch again...")
                 continue
+
+            suspicious_indices = find_suspicious_unchanged_translations(
+                batch, translated_batch, source_lang=source_lang
+            )
+            leak_threshold = max(3, (len(batch) * 8 + 99) // 100)
+            if len(suspicious_indices) >= leak_threshold:
+                if source_leak_retry_count < max_source_leak_retries:
+                    source_leak_retry_count += 1
+                    corrective_message = (
+                        f"Your previous answer left lines {', '.join(map(str, suspicious_indices[:8]))} effectively unchanged in {source_lang or 'the source language'}. "
+                        "Re-evaluate the whole batch using scene context and reference_content, then return only corrected Latin American Spanish JSON."
+                    )
+                    clear_progress()
+                    warning_with_progress(
+                        "Detected source-language leakage in the batch. Retrying with stricter context review..."
+                    )
+                    continue
+                raise ValueError(
+                    f"Persistent source language leak detected in batch lines: {', '.join(map(str, suspicious_indices[:8]))}"
+                )
+            elif suspicious_indices:
+                logger.log_only(
+                    f"Minor unchanged-source warning ignored for batch: {', '.join(map(str, suspicious_indices[:8]))}"
+                )
 
             # Final application of translations
             for item in translated_batch:
@@ -1565,10 +2920,14 @@ def process_batch_streaming(
                 translated_subtitle[idx] = content
 
                 # Apply translation to all duplicates of this text
-                if dialogue_lines is not None and unique_text_indices is not None:
-                    original_text_content = dialogue_lines[idx].strip()
-                    if original_text_content in unique_text_indices:
-                        for duplicate_idx in unique_text_indices[original_text_content]:
+                if (
+                    dialogue_lines is not None
+                    and unique_text_indices is not None
+                    and deduplication_keys is not None
+                ):
+                    dedup_key = deduplication_keys[idx]
+                    if dedup_key in unique_text_indices:
+                        for duplicate_idx in unique_text_indices[dedup_key]:
                             if duplicate_idx != idx:  # Skip the one we just translated
                                 translated_subtitle[duplicate_idx] = content
 
@@ -1640,6 +2999,8 @@ def translate_ass_file(
     api_manager,
     model_name,
     audio_model_name,
+    reference_subtitle_path,
+    reference_lang_code,
     output_dir,
     original_mkv_stem,
     lang_code,
@@ -1674,6 +3035,7 @@ def translate_ass_file(
     Returns:
         Path to translated subtitle file, or None on failure
     """
+    provider = api_manager.provider
     tmp_dir = Path("tmp")
     tmp_dir.mkdir(exist_ok=True)
 
@@ -1693,6 +3055,13 @@ def translate_ass_file(
     audio_extracted = False
 
     try:
+        if is_ollama_provider(provider) and (audio_file or extract_audio):
+            logger.warning(
+                "Audio-assisted translation is currently only supported with Gemini. Continuing without audio context."
+            )
+            audio_file = None
+            extract_audio = False
+
         # Extract audio from video if requested
         if video_path and extract_audio:
             if video_path.exists():
@@ -1720,6 +3089,8 @@ def translate_ass_file(
             logger.info("Audio loaded successfully. Gender-aware translation enabled.")
         elif audio_file:
             logger.error(f"Audio file {audio_file} does not exist.")
+
+        reference_contexts = {}
 
         # Normalize ASS color codes to spec-compliant format before parsing
         normalize_ass_colors(ass_path)
@@ -1833,16 +3204,42 @@ def translate_ass_file(
             logger.warning(f"No valid dialogue lines found in {ass_path.name}.")
             return None, batch_size
 
+        if reference_subtitle_path:
+            try:
+                reference_entries = load_reference_subtitle_entries(
+                    reference_subtitle_path, strip_sdh=strip_sdh
+                )
+                reference_contexts = build_reference_context_map(
+                    dialogue_events, reference_entries
+                )
+                logger.info(
+                    f"Loaded aligned {reference_lang_code} context for {len(reference_contexts)} dialogue lines"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load secondary subtitle context from {reference_subtitle_path.name}: {e}"
+                )
+
         total_lines = len(dialogue_lines)
 
+        if reference_contexts and batch_size > 120:
+            adjusted_batch_size = min(batch_size, 120)
+            logger.info(
+                f"Secondary subtitle context enabled. Reducing batch size from {batch_size} to {adjusted_batch_size} for stability."
+            )
+            batch_size = adjusted_batch_size
+
         # Deduplicate lines (same text with different effects/layers)
-        # Maps unique text -> list of indices with that text
+        # Maps (unique text + aligned reference context) -> list of indices
         text_to_indices = {}
+        deduplication_keys = []
         for i, line in enumerate(dialogue_lines):
             stripped = line.strip()
-            if stripped not in text_to_indices:
-                text_to_indices[stripped] = []
-            text_to_indices[stripped].append(i)
+            dedup_key = (stripped, reference_contexts.get(i, ""))
+            deduplication_keys.append(dedup_key)
+            if dedup_key not in text_to_indices:
+                text_to_indices[dedup_key] = []
+            text_to_indices[dedup_key].append(i)
 
         duplicate_count = total_lines - len(text_to_indices)
         if duplicate_count > 0:
@@ -1855,10 +3252,11 @@ def translate_ass_file(
         MIN_TRANSLATION_LENGTH = 2
         lines_to_translate = []  # List of indices that need translation
         translation_map = {}  # Maps index to original text for short lines
-        unique_texts_to_translate = []  # Unique texts that need translation
-        unique_text_indices = {}  # Maps unique text -> first occurrence index
+        unique_texts_to_translate = []  # Unique texts/contexts that need translation
+        unique_text_indices = {}  # Maps dedup key -> indices
 
-        for unique_text, indices in text_to_indices.items():
+        for dedup_key, indices in text_to_indices.items():
+            unique_text = dedup_key[0]
             first_idx = indices[0]  # Use first occurrence as representative
 
             # Only apply MIN_TRANSLATION_LENGTH to Latin scripts
@@ -1872,8 +3270,8 @@ def translate_ass_file(
                     translation_map[idx] = dialogue_lines[idx]
             else:
                 # This text needs translation (either non-Latin or long enough)
-                unique_texts_to_translate.append(unique_text)
-                unique_text_indices[unique_text] = indices
+                unique_texts_to_translate.append(dedup_key)
+                unique_text_indices[dedup_key] = indices
                 lines_to_translate.append(
                     first_idx
                 )  # Track first occurrence for progress
@@ -1944,12 +3342,19 @@ def translate_ass_file(
                                 if hasattr(e, "type") and e.type == "Dialogue"
                             ]
 
-                            # Extract already translated lines (load ALL events, not just [:start_line])
-                            # This matches gemini-srt-translator's approach (line 352)
-                            for i, event in enumerate(partial_events):
-                                if i < len(translated_subtitle):
+                            partial_event_map = {}
+                            for partial_event in partial_events:
+                                signature = get_dialogue_event_signature(partial_event)
+                                partial_event_map.setdefault(signature, []).append(
+                                    partial_event
+                                )
+
+                            for i, event in enumerate(dialogue_events):
+                                signature = get_dialogue_event_signature(event)
+                                matching_events = partial_event_map.get(signature, [])
+                                if matching_events:
                                     translated_subtitle[i] = remove_formatting(
-                                        event.text
+                                        matching_events.pop(0).text
                                     )
 
                             logger.info(
@@ -1964,8 +3369,9 @@ def translate_ass_file(
                     progress_file_path.unlink()
 
         use_audio_fallback = False
+        client = api_manager.get_client()
 
-        if audio_part and lines_to_translate:
+        if is_gemini_provider(provider) and audio_part and lines_to_translate:
             sample_idx = lines_to_translate[0]
             audio_probe_batch = [
                 {
@@ -1977,7 +3383,7 @@ def translate_ass_file(
             ]
             try:
                 probe_audio_input_support(
-                    client=api_manager.get_client(),
+                    client=client,
                     model_name=model_name,
                     sample_batch=audio_probe_batch,
                     audio_part=audio_part,
@@ -2000,10 +3406,9 @@ def translate_ass_file(
             thinking=thinking,
             audio_file=audio_file if not use_audio_fallback else None,
             gender_hints=use_audio_fallback,
+            reference_lang=reference_lang_code,
         )
 
-        # Configure API - get client from manager
-        client = api_manager.get_client()
         config = get_translation_config(
             system_instruction,
             model_name,
@@ -2012,6 +3417,7 @@ def translate_ass_file(
             temperature,
             top_p,
             top_k,
+            provider,
         )
 
         # Process in batches (only translatable lines)
@@ -2045,7 +3451,12 @@ def translate_ass_file(
         # Build context if resuming
         if start_line > 0:
             previous_message = build_resume_context(
-                dialogue_lines, translated_subtitle, start_line, batch_size
+                dialogue_lines,
+                translated_subtitle,
+                start_line,
+                batch_size,
+                provider,
+                reference_contexts,
             )
 
         # Signal handler for graceful interruption (matching gemini-srt-translator)
@@ -2092,7 +3503,7 @@ def translate_ass_file(
         delay = False
         delay_time = 30
 
-        if "pro" in model_name:
+        if is_gemini_provider(provider) and "pro" in model_name:
             if free_quota:
                 delay = True
                 if not api_manager.has_secondary_key():
@@ -2121,6 +3532,8 @@ def translate_ass_file(
                     "index": str(line_idx),
                     "content": dialogue_lines[line_idx],
                 }
+                if reference_contexts.get(line_idx):
+                    batch_item["reference_content"] = reference_contexts[line_idx]
                 # Add time codes if audio is present (for gender-aware translation)
                 if audio_file:
                     batch_item["time_start"] = str(dialogue_events[line_idx].start)
@@ -2167,7 +3580,9 @@ def translate_ass_file(
                     request_audio_file = None
 
                 # Validate batch size against the actual request payload
-                while not validate_batch_tokens(client, request_batch, model_name):
+                while not validate_batch_tokens(
+                    client, request_batch, model_name, provider
+                ):
                     clear_progress()
                     new_batch_size = prompt_new_batch_size(batch_size)
                     decrement = batch_size - new_batch_size
@@ -2226,6 +3641,9 @@ def translate_ass_file(
                     audio_file=request_audio_file,
                     dialogue_lines=dialogue_lines,
                     unique_text_indices=unique_text_indices,
+                    deduplication_keys=deduplication_keys,
+                    provider=provider,
+                    source_lang=lang_code,
                 )
                 batch_number += 1  # Increment for next batch
 
@@ -2271,8 +3689,10 @@ def translate_ass_file(
                 # Clear progress bar before logging
                 clear_progress()
 
-                if audio_part and not use_audio_fallback and is_audio_capability_error(
-                    error_msg
+                if (
+                    audio_part
+                    and not use_audio_fallback
+                    and is_audio_capability_error(error_msg)
                 ):
                     warning_with_progress(
                         f"Model {model_name} rejected audio input. Switching to audio fallback model {audio_model_name}."
@@ -2284,6 +3704,7 @@ def translate_ass_file(
                         thinking=thinking,
                         audio_file=None,
                         gender_hints=True,
+                        reference_lang=reference_lang_code,
                     )
                     config = get_translation_config(
                         system_instruction,
@@ -2293,6 +3714,7 @@ def translate_ass_file(
                         temperature,
                         top_p,
                         top_k,
+                        provider,
                     )
                     i = batch_start_i
                     batch.clear()
@@ -2300,8 +3722,16 @@ def translate_ass_file(
                     progress_bar(current=i, total=total, model_name=model_name)
                     continue
 
+                if is_ollama_provider(provider) and is_permanent_ollama_error(
+                    error_msg
+                ):
+                    raise
+
+                if "source language leak" in error_msg.lower():
+                    raise
+
                 # Handle quota errors with API switching or wait (gemini-srt-translator lines 553-564)
-                if (
+                if is_gemini_provider(provider) and (
                     "quota" in error_msg.lower()
                     or "503" in error_msg
                     or "UNAVAILABLE" in error_msg
@@ -2531,6 +3961,7 @@ def process_mkv_file(
     model_name,
     audio_model_name,
     remembered_lang=None,
+    remembered_secondary_lang=None,
     batch_size=300,
     thinking=True,
     thinking_budget=2048,
@@ -2546,7 +3977,8 @@ def process_mkv_file(
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
     extracts, translates, and merges the chosen track.
-    Returns tuple: (language code, final batch size) to be remembered for subsequent files.
+    Returns tuple: (primary language code, secondary language code, final batch size)
+    to be remembered for subsequent files.
 
     Args:
         free_quota: If True (default), apply rate limiting for free tier users.
@@ -2562,7 +3994,7 @@ def process_mkv_file(
 
     if expected_output_path.exists():
         logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
-        return None, batch_size
+        return None, None, batch_size
 
     tmp_dir = Path("tmp")
     tmp_dir.mkdir(exist_ok=True)
@@ -2576,68 +4008,44 @@ def process_mkv_file(
         mkv_info = json.loads(result.stdout)
 
         # 2. Select subtitle track
-        selected_track, lang_code = select_subtitle_track(
-            mkv_info.get("tracks", []), remembered_lang
+        (
+            selected_track,
+            lang_code,
+            secondary_track,
+            secondary_lang_code,
+        ) = select_subtitle_tracks(
+            mkv_info.get("tracks", []), remembered_lang, remembered_secondary_lang
         )
 
         if selected_track is None:
             logger.warning(
                 f"No suitable subtitle track found in {mkv_path.name}. Skipping."
             )
-            return None, batch_size
+            return None, None, batch_size
 
-        # 3. Check for supported subtitle format and extract the track
-        codec_id = selected_track.get("properties", {}).get("codec_id")
-        supported_codecs = {
-            "S_TEXT/ASS": ".ass",
-            "S_TEXT/SSA": ".ssa",
-            "S_TEXT/UTF8": ".srt",
-        }
+        # 3. Extract primary and optional secondary subtitle tracks
+        extracted_ass_path, subtitle_extension = extract_subtitle_track(
+            mkv_path, selected_track, tmp_dir, lang_code
+        )
+        if not extracted_ass_path:
+            return None, None, batch_size
 
-        if codec_id not in supported_codecs:
-            logger.warning(
-                f"Unsupported subtitle format '{codec_id}' in {mkv_path.name}. Skipping."
+        reference_subtitle_path = None
+        if secondary_track and secondary_lang_code:
+            reference_subtitle_path, _ = extract_subtitle_track(
+                mkv_path,
+                secondary_track,
+                tmp_dir,
+                secondary_lang_code,
+                label="reference",
             )
-            return None, batch_size
-
-        subtitle_track_id = selected_track["id"]
-        subtitle_extension = supported_codecs[codec_id]
-
-        extracted_ass_path = (
-            tmp_dir / f"{mkv_path.stem}.{lang_code}{subtitle_extension}"
-        )
-        mkvextract_cmd = [
-            "mkvextract",
-            "tracks",
-            str(mkv_path),
-            f"{subtitle_track_id}:{extracted_ass_path}",
-        ]
-        logging.debug(
-            f"Extracting track {subtitle_track_id} ({lang_code}, {codec_id}) to: {extracted_ass_path}"
-        )
-
-        result = subprocess.run(
-            mkvextract_cmd, capture_output=True, text=True, encoding="utf-8"
-        )
-
-        # Check for MKV corruption
-        if (
-            "Error in the Matroska file structure" in result.stdout
-            or "Resync failed" in result.stdout
-        ):
-            logger.warning(
-                f"MKV file {mkv_path.name} appears to be corrupted. Skipping."
-            )
-            if extracted_ass_path.is_file():
-                extracted_ass_path.unlink()
-            return None, batch_size
-
-        # Check if the file was actually created
-        if not extracted_ass_path.is_file() or extracted_ass_path.stat().st_size == 0:
-            logger.error(f"Extraction failed for {mkv_path.name}")
-            return None, batch_size
-
-        logging.debug(f"Successfully extracted subtitle track to {extracted_ass_path}")
+            if reference_subtitle_path:
+                logger.info(f"Using secondary subtitle context: {secondary_lang_code}")
+            else:
+                logger.warning(
+                    "Failed to extract secondary subtitle context track. Continuing with primary subtitles only."
+                )
+                secondary_lang_code = None
 
         # 4. Translate the extracted file (preserving original format)
         translated_ass_path, final_batch_size = translate_ass_file(
@@ -2645,6 +4053,8 @@ def process_mkv_file(
             api_manager,
             model_name,
             audio_model_name,
+            reference_subtitle_path,
+            secondary_lang_code,
             tmp_dir,
             mkv_path.stem,
             lang_code,
@@ -2667,7 +4077,7 @@ def process_mkv_file(
         if translated_ass_path:
             merge_subtitles_to_mkv(mkv_path, translated_ass_path, output_dir)
 
-        return lang_code, final_batch_size
+        return lang_code, secondary_lang_code, final_batch_size
 
     except FileNotFoundError:
         logger.error(
@@ -2680,7 +4090,7 @@ def process_mkv_file(
     except Exception as e:
         logger.error(f"Unexpected error while processing {mkv_path.name}: {e}")
 
-    return None, batch_size
+    return None, None, batch_size
 
 
 # --- Main Execution ---
@@ -2688,7 +4098,7 @@ def process_mkv_file(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini.\n\n"
+        description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini or Ollama.\n\n"
         "Usage:\n"
         "  %(prog)s <file.mkv>              # Process a single file\n"
         "  %(prog)s <directory>             # Process all .mkv files in directory",
@@ -2696,27 +4106,42 @@ def main():
     )
 
     parser.add_argument(
-        "--api-key",
-        help="Primary API key for Google Gemini (or set GEMINI_API_KEY env var).",
+        "--provider",
+        choices=SUPPORTED_PROVIDERS,
+        default=None,
+        help="LLM provider to use: gemini, ollama-local, or ollama-cloud (default: env LLM_PROVIDER or gemini).",
     )
     parser.add_argument(
-        "--api-key2", help="Secondary API key for additional quota (optional)."
+        "--base-url",
+        help="Custom API base URL. Useful for Ollama (for example http://127.0.0.1:11434 or https://ollama.com).",
+    )
+    parser.add_argument(
+        "--api-key",
+        help="Primary API key for the selected provider. Gemini: GEMINI_API_KEY/GOOGLE_API_KEY. Ollama Cloud: OLLAMA_API_KEY.",
+    )
+    parser.add_argument(
+        "--api-key2",
+        help="Secondary Gemini API key for quota failover (optional).",
     )
     parser.add_argument(
         "--model",
-        default="models/gemma-4-31b-it",
-        help="The model to use for translation (default: 'models/gemma-4-31b-it'). "
-        "Note: Pro models may take longer for thinking, but have automatic timeout/retry.",
+        default=None,
+        help="The model to use for translation. Defaults to 'models/gemma-4-31b-it' for Gemini and 'llama3.2' for local Ollama. Ollama Cloud requires an explicit model.",
     )
     parser.add_argument(
         "--audio-model",
-        default="models/gemini-3.1-flash-lite-preview",
-        help="Fallback model to analyze audio for gender hints when the translation model cannot accept audio input (default: 'models/gemini-3.1-flash-lite-preview').",
+        default=None,
+        help="Fallback Gemini model to analyze audio for gender hints when the translation model cannot accept audio input (default: 'models/gemini-3.1-flash-lite-preview').",
     )
     parser.add_argument(
         "--list-models",
         action="store_true",
-        help="List available Gemini models and exit.",
+        help="List available models for the selected provider and exit.",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Show loaded configuration, test provider connectivity, and inspect a single MKV's subtitle tracks.",
     )
     parser.add_argument(
         "--output-dir",
@@ -2762,6 +4187,11 @@ def main():
         "--keep-original",
         action="store_true",
         help="Keep original text as hidden comments in ASS subtitles (format: {Original: text}translation).",
+    )
+    parser.add_argument(
+        "--add-original-only",
+        action="store_true",
+        help="Post-process existing translated ASS output and inject {Original: ...} comments from a chosen subtitle track, then rebuild the translated MKV.",
     )
     parser.add_argument(
         "-a",
@@ -2819,9 +4249,94 @@ def main():
 
     args = parser.parse_args()
 
+    dotenv_loaded = load_dotenv_file(Path(".env"))
+
+    # Initialize logger settings early so utility modes also use them
+    logger.set_color_mode(not args.no_colors)
+    logger.enable_file_logging(args.progress_log)
+    logger.enable_thoughts_logging(args.thoughts_log)
+
+    if args.add_original_only:
+        try:
+            files_to_process = resolve_mkv_input_files(args.input_path)
+        except ValueError as e:
+            logger.error(str(e))
+            parser.print_help()
+            sys.exit(1)
+
+        if not check_mkvtoolnix():
+            sys.exit(1)
+
+        args.output_dir.mkdir(exist_ok=True)
+
+        if not files_to_process:
+            logger.warning("No .mkv files found to process.")
+            return
+
+        remembered_original_lang = None
+        for file_path in files_to_process:
+            chosen_original_lang = add_original_comments_to_existing_output(
+                file_path,
+                args.output_dir,
+                remembered_lang=remembered_original_lang,
+            )
+            if chosen_original_lang:
+                remembered_original_lang = chosen_original_lang
+
+        return
+
+    args.provider = args.provider or os.environ.get("LLM_PROVIDER", "gemini")
+    if args.provider not in SUPPORTED_PROVIDERS:
+        logger.error(f"provider must be one of: {', '.join(SUPPORTED_PROVIDERS)}")
+        sys.exit(1)
+
+    args.base_url = args.base_url or os.environ.get("LLM_BASE_URL")
+
+    args.model = (
+        args.model or os.environ.get("LLM_MODEL") or get_default_model(args.provider)
+    )
+    args.audio_model = (
+        args.audio_model
+        or os.environ.get("LLM_AUDIO_MODEL")
+        or get_default_audio_model(args.provider)
+    )
+
+    if args.provider == "ollama-cloud" and not args.model:
+        logger.error("ollama-cloud requires --model to be set explicitly")
+        sys.exit(1)
+
     # Handle thinking mode flags
     if args.no_thinking:
         args.thinking = False
+
+    if is_ollama_provider(args.provider):
+        if args.thinking:
+            logger.info(
+                "Thinking mode is only supported for Gemini. Ignoring it for Ollama."
+            )
+        args.thinking = False
+
+        if args.audio_file or args.extract_audio:
+            logger.warning(
+                "Audio-assisted translation is currently only supported with Gemini. Continuing without audio input."
+            )
+            args.audio_file = None
+            args.extract_audio = False
+
+        if args.audio_model:
+            logger.info(
+                "--audio-model is only used with Gemini and will be ignored for Ollama."
+            )
+
+        if args.api_key2:
+            logger.info(
+                "--api-key2 is only used for Gemini quota failover and will be ignored for Ollama."
+            )
+
+        if args.paid_quota:
+            logger.info(
+                "--paid-quota only affects Gemini rate limiting and will be ignored for Ollama."
+            )
 
     # Validate thinking_budget
     if args.thinking_budget < 0 or args.thinking_budget > 24576:
@@ -2845,7 +4360,9 @@ def main():
 
     # Info message for Pro models with thinking
     if (
-        args.thinking
+        is_gemini_provider(args.provider)
+        and args.model
+        and args.thinking
         and "pro" in args.model.lower()
         and "flash" not in args.model.lower()
     ):
@@ -2855,47 +4372,85 @@ def main():
             f"Automatic timeout/retry enabled - will retry if thinking exceeds 5 minutes."
         )
 
-    # Initialize enhanced logger settings
-    logger.set_color_mode(not args.no_colors)
-    logger.enable_file_logging(args.progress_log)
-    logger.enable_thoughts_logging(args.thoughts_log)
+    api_manager = None
+    client = None
+    init_error = None
 
     # Initialize API manager (with dual API key support)
     try:
-        if args.api_key:
-            api_manager = APIManager(args.api_key, args.api_key2)
-        else:
-            # Use environment variable for primary key
-            import os
-
+        env_key = None
+        if is_gemini_provider(args.provider):
             env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get(
                 "GOOGLE_API_KEY"
             )
-            if not env_key:
-                raise ValueError("No API key provided")
-            api_manager = APIManager(env_key, args.api_key2)
+        elif args.provider == "ollama-cloud":
+            env_key = os.environ.get("OLLAMA_API_KEY")
+
+        primary_key = args.api_key or env_key
+
+        if is_gemini_provider(args.provider) and not primary_key:
+            raise ValueError("No Gemini API key provided")
+
+        if args.provider == "ollama-cloud" and not primary_key:
+            raise ValueError("No Ollama Cloud API key provided")
+
+        api_manager = APIManager(
+            provider=args.provider,
+            api_key=primary_key,
+            api_key2=args.api_key2 if is_gemini_provider(args.provider) else None,
+            base_url=args.base_url,
+        )
 
         # Create initial client
         client = api_manager.get_client()
-        logging.debug(f"Initialized Google Gemini client")
+        logging.debug(f"Initialized {get_provider_display_name(args.provider)} client")
 
         # Show dual API status
-        if api_manager.has_secondary_key():
+        if is_gemini_provider(args.provider) and api_manager.has_secondary_key():
             logger.info(f"Dual API keys configured - automatic quota failover enabled")
 
+        if is_ollama_provider(args.provider):
+            logger.info(
+                f"Using {get_provider_display_name(args.provider)} at {api_manager.base_url}"
+            )
+
     except Exception as e:
-        logger.error(f"Failed to initialize Google Gemini client: {e}")
-        logger.error(
-            "Make sure you provide --api-key or set GEMINI_API_KEY/GOOGLE_API_KEY environment variable"
+        init_error = e
+
+    if args.doctor:
+        overall_ok = run_doctor(
+            args,
+            api_manager=api_manager,
+            client=client,
+            init_error=init_error,
+            dotenv_loaded=dotenv_loaded,
         )
+        sys.exit(0 if overall_ok else 1)
+
+    if init_error is not None:
+        logger.error(
+            f"Failed to initialize {get_provider_display_name(args.provider)} client: {init_error}"
+        )
+        if is_gemini_provider(args.provider):
+            logger.error("Provide --api-key or set GEMINI_API_KEY/GOOGLE_API_KEY.")
+        elif args.provider == "ollama-cloud":
+            logger.error("Provide --api-key or set OLLAMA_API_KEY.")
+        else:
+            logger.error(
+                "Make sure Ollama is running, or set --base-url/OLLAMA_HOST/LLM_BASE_URL to the correct server."
+            )
         sys.exit(1)
 
     # Handle --list-models before checking other args
     if args.list_models:
         try:
-            print("Available Gemini models for translation:")
-            for m in client.models.list():
-                print(f"  {m.name}")
+            print(f"Available {get_provider_display_name(args.provider)} models:")
+            if is_gemini_provider(args.provider):
+                for m in client.models.list():
+                    print(f"  {m.name}")
+            else:
+                for model_name in extract_ollama_model_names(client.list()):
+                    print(f"  {model_name}")
         except Exception as e:
             logger.error(f"Failed to list models. Error: {e}")
             sys.exit(1)
@@ -2916,19 +4471,10 @@ def main():
     logging.debug(f"Batch size: {args.batch_size}")
 
     # File processing loop
-    files_to_process = []
-    if args.input_path.is_file():
-        if args.input_path.suffix == ".mkv":
-            files_to_process = [args.input_path]
-            logging.debug(f"Processing single file: {args.input_path.resolve()}")
-        else:
-            logger.error(f"File must be an .mkv file: {args.input_path}")
-            sys.exit(1)
-    elif args.input_path.is_dir():
-        files_to_process = sorted(list(args.input_path.glob("*.mkv")))
-        logger.info(f"Searching for .mkv files in: {args.input_path.resolve()}")
-    else:
-        logger.error(f"Path does not exist: {args.input_path}")
+    try:
+        files_to_process = resolve_mkv_input_files(args.input_path)
+    except ValueError as e:
+        logger.error(str(e))
         sys.exit(1)
 
     if not files_to_process:
@@ -2936,19 +4482,21 @@ def main():
         return
 
     remembered_lang = None
+    remembered_secondary_lang = None
     remembered_batch_size = args.batch_size
     for file_path in files_to_process:
         if file_path.suffix == ".mkv":
             # Set free_quota based on paid_quota flag (inverted logic)
             free_quota = not args.paid_quota
 
-            chosen_lang, final_batch_size = process_mkv_file(
+            chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
                 file_path,
                 args.output_dir,
                 api_manager,
                 args.model,
                 args.audio_model,
                 remembered_lang,
+                remembered_secondary_lang,
                 remembered_batch_size,
                 args.thinking,
                 args.thinking_budget,
@@ -2962,8 +4510,9 @@ def main():
                 args.strip_sdh,
             )
             # Remember language selection for subsequent files
-            if chosen_lang and not remembered_lang:
+            if chosen_lang:
                 remembered_lang = chosen_lang
+            remembered_secondary_lang = chosen_secondary_lang
             # Remember batch size adjustment for subsequent files
             if final_batch_size and final_batch_size != remembered_batch_size:
                 logger.info(
