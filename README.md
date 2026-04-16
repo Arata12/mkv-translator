@@ -1,12 +1,14 @@
 # MKV Subtitle Translator
 
-A Python-based command-line tool that automatically extracts, translates, and re-embeds subtitles into MKV video files. Designed specifically to translate subtitles from various languages to Latin American Spanish using Google's Gemini AI API.
+A Python-based command-line tool that automatically extracts, translates, and re-embeds subtitles into MKV video files. It can translate subtitles from various languages to Latin American Spanish using either Google Gemini or Ollama.
 
 ## Features
 
 - **Automatic subtitle extraction** from MKV files using MKVToolNix
-- **AI-powered translation** to Latin American Spanish (es-419) via Google Gemini API
+- **AI-powered translation** to Latin American Spanish (es-419) via Google Gemini or Ollama
 - **Gemma-first translation** - uses `models/gemma-4-31b-it` by default for subtitle translation
+- **Selectable provider** - choose `gemini`, `ollama-local`, or `ollama-cloud`
+- **Optional dual-subtitle context** - choose a primary subtitle language and optionally a secondary subtitle language as reference context
 - **Gender-aware translation** - analyzes audio to apply correct grammatical gender forms (verb conjugations, adjectives, pronouns), with automatic fallback to an audio-capable Gemini model when the main model does not support audio input
 - **Batch processing** with configurable batch sizes for efficient translation
 - **Resume capability** - automatically saves progress and resumes interrupted translations
@@ -53,16 +55,29 @@ pip install -r requirements.txt
 
 **Dependencies:**
 - `google-genai` - Google Gemini API client
+- `ollama` - Ollama Python client (local server or Ollama Cloud)
 - `pysubs2` - Subtitle file parsing (.ass, .srt, .ssa)
 - `json-repair` - Robust JSON parsing for API responses
 
 ### API Requirements
 
-**Google Gemini API Key** is required. Get one from [Google AI Studio](https://aistudio.google.com/app/apikey).
+Choose one provider:
 
-You can provide the API key via:
-1. Command-line argument: `--api-key YOUR_KEY`
-2. Environment variable: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- **Google Gemini**: requires an API key from [Google AI Studio](https://aistudio.google.com/app/apikey)
+  - CLI: `--provider gemini --api-key YOUR_KEY`
+  - Env: `GEMINI_API_KEY` or `GOOGLE_API_KEY`
+- **Ollama local**: requires a running Ollama server (default `http://127.0.0.1:11434`)
+  - CLI: `--provider ollama-local`
+  - Env override: `OLLAMA_HOST`
+- **Ollama Cloud**: requires an Ollama Cloud API key
+  - CLI: `--provider ollama-cloud --api-key YOUR_KEY`
+  - Env: `OLLAMA_API_KEY`
+
+You can also set `LLM_PROVIDER` to choose the default provider.
+Optional shared env vars:
+- `LLM_MODEL`
+- `LLM_AUDIO_MODEL`
+- `LLM_BASE_URL`
 
 ## Installation
 
@@ -72,7 +87,10 @@ You can provide the API key via:
    pip install -r requirements.txt
    ```
 3. Install MKVToolNix for your platform (see System Dependencies above)
-4. Obtain a Google Gemini API key
+4. Choose a provider:
+   - Gemini: obtain an API key
+   - Ollama local: install/run Ollama and pull a model
+   - Ollama Cloud: obtain an API key
 
 ## Usage
 
@@ -88,6 +106,11 @@ Translate all MKV files in a directory:
 python3 translator.py --api-key YOUR_API_KEY /path/to/videos/
 ```
 
+When multiple subtitle languages are present, the tool asks which language should be the primary source.
+If another subtitle language is available, it can also ask whether you want to use it as secondary context.
+This is useful for workflows like **French as the main source + English as reference** before translating to Spanish.
+The secondary subtitle is used as **scene-level semantic context**, aligned mainly by timing rather than strict line numbers, so it can still help when FR/EN segmentation does not match exactly.
+
 ### Command-Line Options
 
 ```
@@ -98,11 +121,15 @@ python3 translator.py [OPTIONS] INPUT_PATH
 - `INPUT_PATH` - Single .mkv file or directory containing .mkv files
 
 **API Configuration:**
-- `--api-key KEY` - Primary Gemini API key (required if not set as environment variable)
-- `--api-key2 KEY` - Secondary API key for automatic failover when quota is reached
-- `--model NAME` - Model to use for subtitle translation (default: `models/gemma-4-31b-it`)
-- `--audio-model NAME` - Fallback model for audio-based gender analysis when `--model` does not accept audio input (default: `models/gemini-3.1-flash-lite-preview`)
-- `--list-models` - List all available Gemini models and exit
+- `--provider {gemini,ollama-local,ollama-cloud}` - Select the LLM provider
+- `--base-url URL` - Override the API base URL (mainly useful for Ollama)
+- `--doctor` - Show loaded config, test provider connectivity, and inspect subtitle tracks for a single MKV
+- `--add-original-only` - Post-process existing translated ASS output, inject `{Original: ...}` from a chosen subtitle track, and rebuild the translated MKV
+- `--api-key KEY` - Primary API key for Gemini or Ollama Cloud
+- `--api-key2 KEY` - Secondary Gemini API key for automatic failover when quota is reached
+- `--model NAME` - Model to use for subtitle translation (default: `models/gemma-4-31b-it` for Gemini, `llama3.2` for local Ollama, required explicitly for Ollama Cloud)
+- `--audio-model NAME` - Fallback Gemini model for audio-based gender analysis (Gemini only)
+- `--list-models` - List models for the selected provider and exit (`ollama-local` shows models currently available on that Ollama host)
 
 **Translation Options:**
 - `--batch-size N` - Number of subtitle lines per batch (default: 300)
@@ -128,15 +155,84 @@ python3 translator.py [OPTIONS] INPUT_PATH
 
 **Single file with default settings:**
 ```bash
-python3 translator.py --api-key YOUR_KEY movie.mkv
+python3 translator.py --provider gemini --api-key YOUR_KEY movie.mkv
 ```
 
-**Directory with dual API keys for continuous processing:**
+**Directory with dual Gemini API keys for continuous processing:**
 ```bash
 python3 translator.py \
+  --provider gemini \
   --api-key PRIMARY_KEY \
   --api-key2 SECONDARY_KEY \
   /path/to/anime/series/
+```
+
+**Use local Ollama:**
+```bash
+python3 translator.py \
+  --provider ollama-local \
+  --model llama3.2 \
+  movie.mkv
+```
+
+**Use Ollama Cloud with API key:**
+```bash
+python3 translator.py \
+  --provider ollama-cloud \
+  --api-key YOUR_OLLAMA_API_KEY \
+  --model YOUR_OLLAMA_CLOUD_MODEL \
+  movie.mkv
+```
+
+**Use a custom Ollama endpoint:**
+```bash
+python3 translator.py \
+  --provider ollama-local \
+  --base-url http://192.168.1.20:11434 \
+  --model llama3.2 \
+  movie.mkv
+```
+
+**Run diagnostics / doctor:**
+```bash
+python3 translator.py --doctor --provider ollama-local --model llama3.2
+```
+
+**Run doctor and inspect subtitle tracks in one MKV:**
+```bash
+python3 translator.py --doctor --provider ollama-local --model llama3.2 episode01.mkv
+```
+
+**Add `Original:` comments after translation:**
+```bash
+python3 translator.py --add-original-only episode01.mkv
+```
+
+If multiple subtitle languages/tracks exist, the tool asks which one should be injected as `Original`.
+This is useful if you translated from French but later decide you want the hidden original comments to use English instead.
+This mode only works with existing translated **ASS** output because `{Original: ...}` comments are ASS-specific.
+
+**Rebuild translated MKVs from corrected ASS files:**
+```bash
+python3 remux_corrected_subs.py translated_subs
+```
+
+This scans `translated_subs/` for pairs like:
+- `episode.translated.ass`
+- `episode.translated.mkv`
+
+Then it replaces the generated Spanish subtitle track inside the MKV with your corrected ASS.
+
+Useful options:
+```bash
+# preview only
+python3 remux_corrected_subs.py translated_subs --dry-run
+
+# keep the old MKV and create *.corrected.mkv
+python3 remux_corrected_subs.py translated_subs --keep-original-mkv
+
+# overwrite, but keep a backup
+python3 remux_corrected_subs.py translated_subs --backup
 ```
 
 **Custom batch size with full logging:**
@@ -236,6 +332,8 @@ When using dual API keys (`--api-key` and `--api-key2`):
 
 When audio is provided (`--extract-audio` or `--audio-file`), the tool analyzes speaker voices to apply correct grammatical gender:
 
+> Audio-assisted gender analysis currently works with Gemini only. When using Ollama, audio options are ignored and translation continues as text-only.
+
 **How it works:**
 - If the selected translation model supports audio, audio is sent alongside subtitle text
 - If the selected translation model does not support audio, the tool automatically falls back to `models/gemini-3.1-flash-lite-preview` for audio analysis and sends the resulting gender hints to the main translation model
@@ -283,7 +381,7 @@ translated_subs/
 - German
 - Japanese
 - French
-- (Other languages can be selected manually)
+- Current automatic language selection is limited to these four language buckets
 
 ## Language-Aware Processing
 
