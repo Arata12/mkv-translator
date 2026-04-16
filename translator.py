@@ -45,10 +45,10 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from audio_utils import prepare_audio
+    from tools.audio_utils import prepare_audio
 except ImportError:
     logging.error(
-        "audio_utils module not found. Please ensure audio_utils.py is in the same directory."
+        "audio_utils module not found. Please ensure tools/audio_utils.py is available."
     )
     sys.exit(1)
 
@@ -497,7 +497,7 @@ def suppress_stderr_output():
 
 # Import progress display module
 try:
-    from progress_display import (
+    from tools.progress_display import (
         progress_bar,
         progress_complete,
         clear_progress,
@@ -508,16 +508,16 @@ try:
     )
 except ImportError:
     logging.error(
-        "progress_display module not found. Make sure progress_display.py is in the same directory."
+        "progress_display module not found. Make sure tools/progress_display.py is available."
     )
     sys.exit(1)
 
 # Import enhanced logger module
 try:
-    import logger
+    from tools import logger
 except ImportError:
     logging.error(
-        "logger module not found. Make sure logger.py is in the same directory."
+        "logger module not found. Make sure tools/logger.py is available."
     )
     sys.exit(1)
 
@@ -3048,7 +3048,7 @@ def translate_ass_file(
     logger.set_thoughts_file_path(str(output_dir / f"{original_mkv_stem}.thoughts.log"))
 
     # Import progress display functions
-    from progress_display import clear_progress
+    from tools.progress_display import clear_progress
 
     # Audio handling for gender-aware translation
     audio_part = None

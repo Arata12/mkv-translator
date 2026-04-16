@@ -9,11 +9,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Import from same directory
+# Import from support package
 try:
-    from logger import error, warning, info, success
+    from tools.logger import error, warning, info, success
 except ImportError:
-    print("Error: logger module not found. Please ensure logger.py is in the same directory.")
+    print("Error: logger module not found. Please ensure tools/logger.py is available.")
     sys.exit(1)
 
 

@@ -130,13 +130,13 @@ python3 translator.py --add-original-only episode01.mkv
 Remux corrected ASS files back into translated MKVs:
 
 ```bash
-python3 remux_corrected_subs.py translated_subs
+python3 tools/remux_corrected_subs.py translated_subs
 ```
 
 Dry-run remux:
 
 ```bash
-python3 remux_corrected_subs.py translated_subs --dry-run
+python3 tools/remux_corrected_subs.py translated_subs --dry-run
 ```
 
 ## All Flags
@@ -176,6 +176,12 @@ By default, files are written to `translated_subs/`:
 - `video.es-419.ass` or `.srt` or `.ssa`
 - `video.translation.log` if `--progress-log` is enabled
 - `video.thoughts.log` if `--thoughts-log` is enabled
+
+## Layout
+
+- `translator.py` - main CLI entrypoint
+- `tools/` - support modules and helper scripts
+- `tools/remux_corrected_subs.py` - remux corrected ASS files back into translated MKVs
 
 ## Notes
 

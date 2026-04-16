@@ -26,7 +26,7 @@ _has_started = False
 def _log_hidden_message(message: str) -> None:
     """Write progress-only messages to the optional file log."""
     try:
-        import logger
+        from tools import logger
 
         logger.log_only(message)
     except Exception:
