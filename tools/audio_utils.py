@@ -12,6 +12,7 @@ from pathlib import Path
 # Import from support package
 try:
     from tools.logger import error, warning, info, success
+    from tools.process_utils import run_tracked_subprocess
 except ImportError:
     print("Error: logger module not found. Please ensure tools/logger.py is available.")
     sys.exit(1)
@@ -32,7 +33,9 @@ def get_audio_info(video_path):
             "ffprobe", "-v", "quiet", "-print_format", "json",
             "-show_streams", "-select_streams", "a", str(video_path)
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
+        result = run_tracked_subprocess(
+            cmd, capture_output=True, text=True, check=True, encoding="utf-8"
+        )
         data = json.loads(result.stdout)
 
         if not data.get("streams"):
@@ -104,7 +107,9 @@ def extract_audio(video_path, output_path, channels, stream_index=0):
     cmd.append(str(output_path))
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False, encoding="utf-8")
+        result = run_tracked_subprocess(
+            cmd, capture_output=True, text=True, check=False, encoding="utf-8"
+        )
         if result.returncode != 0:
             raise RuntimeError(f"FFmpeg failed with return code {result.returncode}")
         return True
@@ -135,7 +140,9 @@ def compress_audio(extracted_audio_path, target_size_mb=20):
 
         # Get audio duration via ffprobe
         cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(extracted_audio_path)]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
+        result = run_tracked_subprocess(
+            cmd, capture_output=True, text=True, check=True, encoding="utf-8"
+        )
         data = json.loads(result.stdout)
 
         if "format" not in data or "duration" not in data["format"]:
@@ -170,7 +177,9 @@ def compress_audio(extracted_audio_path, target_size_mb=20):
             str(compressed_path)
         ]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
+        result = run_tracked_subprocess(
+            cmd, capture_output=True, text=True, check=True, encoding="utf-8"
+        )
 
         # Verify and check if still too large
         if not os.path.exists(compressed_path):
@@ -192,7 +201,9 @@ def compress_audio(extracted_audio_path, target_size_mb=20):
                 str(aggressive_path)
             ]
 
-            subprocess.run(cmd, capture_output=True, text=True, check=True, encoding="utf-8")
+            run_tracked_subprocess(
+                cmd, capture_output=True, text=True, check=True, encoding="utf-8"
+            )
 
             # Replace initial compressed file with aggressive version
             if os.path.exists(compressed_path):

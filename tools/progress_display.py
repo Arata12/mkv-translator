@@ -90,7 +90,8 @@ def progress_bar(current, total, model_name, chunk_size=0,
                  is_loading=False, is_sending=False, is_thinking=False,
                  is_retrying=False, retry_countdown=0, bar_length=30,
                  thinking_time="", message="", message_color=None,
-                 status_detail="", status_color=None):
+                 status_detail="", status_color=None, task_label="Translating",
+                 count_text=""):
     """
     Display animated progress bar with real-time updates and optional message below.
 
@@ -127,6 +128,8 @@ def progress_bar(current, total, model_name, chunk_size=0,
             "thinking_time": thinking_time,
             "status_detail": status_detail,
             "status_color": status_color,
+            "task_label": task_label,
+            "count_text": count_text,
         }
 
         term_width = shutil.get_terminal_size(fallback=(140, 20)).columns
@@ -136,7 +139,8 @@ def progress_bar(current, total, model_name, chunk_size=0,
         percentage = int(100 * progress_ratio)
         display_current = current + chunk_size
 
-        prefix_without_bar = f"Translating: || {percentage}% ({display_current}/{total})"
+        count_display = count_text or f"{display_current}/{total}"
+        prefix_without_bar = f"{task_label}: || {percentage}% ({count_display})"
         max_bar_length = max(10, term_width // 4)
         bar_length = min(bar_length, max_bar_length)
         filled_length = int(bar_length * progress_ratio)
@@ -159,17 +163,22 @@ def progress_bar(current, total, model_name, chunk_size=0,
             status = f"| Processing {_LOADING_BARS[_loading_bar_index]}"
             _loading_bar_index = (_loading_bar_index + 1) % len(_LOADING_BARS)
 
-        prefix = f"Translating: |{bar}| {percentage}% ({display_current}/{total})"
+        prefix = f"{task_label}: |{bar}| {percentage}% ({count_display})"
         suffix_parts = [model_name]
         if status:
             suffix_parts.append(status)
-        if status_detail:
-            suffix_parts.append(status_detail)
-        suffix = " ".join(part for part in suffix_parts if part).strip()
+        base_suffix = " ".join(part for part in suffix_parts if part).strip()
 
-        if suffix:
-            available_suffix = max(0, term_width - len(prefix) - 1)
-            suffix = _truncate_text(suffix, available_suffix)
+        if status_detail:
+            available_detail = max(0, term_width - len(prefix) - len(base_suffix) - 2)
+            truncated_detail = _truncate_text(status_detail, available_detail)
+        else:
+            truncated_detail = ""
+
+        if base_suffix or truncated_detail:
+            suffix = base_suffix
+            if truncated_detail:
+                suffix = f"{suffix} {truncated_detail}".strip()
             progress_text = f"{prefix} {suffix}".rstrip()
         else:
             progress_text = prefix
@@ -183,6 +192,12 @@ def progress_bar(current, total, model_name, chunk_size=0,
             # Highlight loading animation characters in green
             for char in _LOADING_BARS:
                 progress_text = progress_text.replace(char, f"\033[32m{char}\033[34m")
+            if truncated_detail and status_color:
+                progress_text = progress_text.replace(
+                    truncated_detail,
+                    f"{status_color}{truncated_detail}\033[34m",
+                    1,
+                )
             # Wrap entire progress text in blue
             progress_text = f"\033[34m{progress_text}\033[0m"
 
@@ -219,28 +234,40 @@ def info_with_progress(message: str) -> None:
     """Display an info message below the progress bar (cyan)"""
     if _last_progress:
         _log_hidden_message(message)
-        progress_bar(**_last_progress, message=message, message_color="\033[36m")
+        progress_state = dict(_last_progress)
+        progress_state["status_detail"] = message
+        progress_state["status_color"] = "\033[36m"
+        progress_bar(**progress_state)
 
 
 def warning_with_progress(message: str) -> None:
     """Display a warning message below the progress bar (yellow)"""
     if _last_progress:
         _log_hidden_message(message)
-        progress_bar(**_last_progress, message=message, message_color="\033[33m")
+        progress_state = dict(_last_progress)
+        progress_state["status_detail"] = message
+        progress_state["status_color"] = "\033[33m"
+        progress_bar(**progress_state)
 
 
 def error_with_progress(message: str) -> None:
     """Display an error message below the progress bar (red)"""
     if _last_progress:
         _log_hidden_message(message)
-        progress_bar(**_last_progress, message=message, message_color="\033[31m")
+        progress_state = dict(_last_progress)
+        progress_state["status_detail"] = message
+        progress_state["status_color"] = "\033[31m"
+        progress_bar(**progress_state)
 
 
 def success_with_progress(message: str) -> None:
     """Display a success message below the progress bar (green)"""
     if _last_progress:
         _log_hidden_message(message)
-        progress_bar(**_last_progress, message=message, message_color="\033[32m")
+        progress_state = dict(_last_progress)
+        progress_state["status_detail"] = message
+        progress_state["status_color"] = "\033[32m"
+        progress_bar(**progress_state)
 
 
 def progress_complete(current, total, model_name):

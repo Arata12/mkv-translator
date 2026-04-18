@@ -4,15 +4,10 @@ Translate MKV subtitle tracks to Latin American Spanish and mux them back into t
 
 ## What It Does
 
-- Extracts subtitle tracks from `.mkv` files
-- Translates them to `es-419`
-- Preserves ASS formatting and styling
+- Translates MKV subtitles to Latin American Spanish
+- Works with text subtitle tracks (`ASS`, `SSA`, `SRT`), hardcoded subtitles, and image subtitle tracks like `PGS`
 - Supports Gemini and Ollama
-- Can use audio for gender-aware translation
-- Supports optional secondary subtitle context
-- Can add `{Original: ...}` comments to existing translated ASS files
-- Can remux corrected ASS files back into translated MKVs
-- Supports resume after interruption
+- Can mux the translated subtitles back into the video
 
 ## Defaults
 
@@ -115,6 +110,12 @@ Use Ollama Cloud:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model YOUR_MODEL video.mkv
 ```
 
+OCR hardcoded subtitles with Ollama Gemma:
+
+```bash
+python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
+```
+
 Run diagnostics:
 
 ```bash
@@ -160,6 +161,15 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--no-colors` - disable colored terminal output
 - `--keep-original` - keep original text as hidden ASS comments during translation
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
+- `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
+- `--ocr-lang CODE` - source language code for OCR subtitles before translation
+- `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
+- `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
+- `--ocr-fps FLOAT` - frame sampling rate before OCR similarity filtering
+- `--ocr-frame-diff FLOAT` - minimum grayscale change before re-running OCR on a sampled frame
+- `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
+- `--ocr-request-batch-size N` - number of images per OCR model request
+- `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
 - `--strip-sdh` - remove SDH elements like speaker names and sound-effect captions
@@ -188,5 +198,8 @@ By default, files are written to `translated_subs/`:
 - The tool resumes interrupted work from `tmp/*.progress`
 - ASS formatting is preserved mechanically, not just by prompt instructions
 - Audio-aware translation is mainly useful for gendered languages like Spanish
-- Ollama currently runs as text-only for translation; Gemini handles audio/gender hints
+- Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
+- OCR mode currently uses Ollama vision models and is best treated as experimental
+- OCR mode samples subtitle events directly for image subtitle tracks like PGS instead of scanning the whole video
+- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages

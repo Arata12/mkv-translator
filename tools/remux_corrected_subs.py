@@ -3,9 +3,10 @@
 import argparse
 import json
 import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+from tools.process_utils import run_tracked_subprocess
 
 
 TARGET_TRACK_NAME = "Spanish (Latin America)"
@@ -14,7 +15,7 @@ TARGET_LANG_PREFIXES = ("es-",)
 
 
 def run_command(command):
-    result = subprocess.run(
+    result = run_tracked_subprocess(
         command,
         capture_output=True,
         text=True,

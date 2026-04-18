@@ -8,10 +8,12 @@ Extracts subtitles from MKV files, translates them using Google Gemini, and merg
 """
 
 import argparse
+import base64
 import contextlib
 import io
 import logging
 import os
+import statistics
 import sys
 import subprocess
 import json
@@ -21,6 +23,10 @@ import threading
 from pathlib import Path
 from collections import Counter
 import unicodedata
+
+
+OLLAMA_LOCAL_TIMEOUT_SECONDS = 120
+OLLAMA_CLOUD_TIMEOUT_SECONDS = 180
 
 try:
     from google import genai
@@ -49,6 +55,34 @@ try:
 except ImportError:
     logging.error(
         "audio_utils module not found. Please ensure tools/audio_utils.py is available."
+    )
+    sys.exit(1)
+
+try:
+    from tools.ocr_utils import (
+        build_srt_from_ocr_results,
+        check_ffmpeg_tools,
+        count_subtitle_bitmap_frames_full_stream,
+        extract_ocr_frames,
+        extract_subtitle_bitmap_frames_full_stream,
+        extract_subtitle_bitmap_frames_at_timestamps,
+        get_default_ocr_extract_workers,
+        get_video_info,
+        resolve_ocr_crop_filter,
+        select_distinct_frame_samples,
+        select_distinct_image_samples,
+    )
+except ImportError:
+    logging.error(
+        "ocr_utils module not found. Please ensure tools/ocr_utils.py is available."
+    )
+    sys.exit(1)
+
+try:
+    from tools.process_utils import cleanup_tracked_processes
+except ImportError:
+    logging.error(
+        "process_utils module not found. Please ensure tools/process_utils.py is available."
     )
     sys.exit(1)
 
@@ -454,7 +488,13 @@ class APIManager:
             if self.current_api_key:
                 headers = {"Authorization": f"Bearer {self.current_api_key}"}
 
-            return OllamaClient(host=self.base_url, headers=headers)
+            timeout = (
+                OLLAMA_CLOUD_TIMEOUT_SECONDS
+                if self.provider == "ollama-cloud"
+                else OLLAMA_LOCAL_TIMEOUT_SECONDS
+            )
+
+            return OllamaClient(host=self.base_url, headers=headers, timeout=timeout)
 
         raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -493,6 +533,12 @@ def suppress_stderr_output():
     """Temporarily silence stderr noise from third-party clients."""
     with contextlib.redirect_stderr(io.StringIO()):
         yield
+
+
+def handle_process_termination(signum, frame):
+    """Ensure tracked external tools are stopped on abrupt termination."""
+    cleanup_tracked_processes()
+    raise SystemExit(1)
 
 
 # Import progress display module
@@ -918,6 +964,31 @@ SUPPORTED_SUBTITLE_CODECS = {
     "S_TEXT/UTF8": ".srt",
 }
 
+OCR_SUBTITLE_CODECS = {"S_HDMV/PGS"}
+
+
+def normalize_track_language(lang_code):
+    """Normalize language names used in prompts and track grouping."""
+    normalized = (lang_code or "").strip().lower()
+    aliases = {
+        "en": "eng",
+        "eng": "eng",
+        "english": "eng",
+        "de": "de",
+        "ger": "de",
+        "deu": "de",
+        "german": "de",
+        "ja": "ja",
+        "jpn": "ja",
+        "jp": "ja",
+        "japanese": "ja",
+        "fr": "fr",
+        "fra": "fr",
+        "fre": "fr",
+        "french": "fr",
+    }
+    return aliases.get(normalized, normalized)
+
 
 def prompt_yes_no(prompt, default=False):
     """Prompt the user for a yes/no answer."""
@@ -965,14 +1036,15 @@ def prompt_subtitle_language(
         print(f"Invalid choice. Please enter one of: {', '.join(lang_options)}.")
 
 
-def get_track_display_name(track):
+def get_track_display_name(track, supported_codecs=None):
     """Build a short human-readable label for a subtitle track."""
     props = track.get("properties", {})
     codec = props.get("codec_id") or "unknown"
     name = props.get("track_name") or "(no name)"
     default_flag = props.get("default_track", False)
     forced_flag = props.get("forced_track", False)
-    supported = codec in SUPPORTED_SUBTITLE_CODECS
+    supported_codecs = supported_codecs or SUPPORTED_SUBTITLE_CODECS
+    supported = codec in supported_codecs
 
     flags = []
     if default_flag:
@@ -984,21 +1056,23 @@ def get_track_display_name(track):
     return f"id={track.get('id')} codec={codec} name={name} flags={','.join(flags)}"
 
 
-def choose_track_for_language(lang_code, lang_tracks):
+def choose_track_for_language(lang_code, lang_tracks, supported_codecs=None):
     """Choose a specific track within one language bucket."""
     if not lang_tracks:
         return None
 
+    supported_codecs = supported_codecs or SUPPORTED_SUBTITLE_CODECS
+
     supported_tracks = [
         track
         for track in lang_tracks
-        if track.get("properties", {}).get("codec_id") in SUPPORTED_SUBTITLE_CODECS
+        if track.get("properties", {}).get("codec_id") in supported_codecs
     ]
 
     if len(lang_tracks) == 1:
         only_track = lang_tracks[0]
         codec = only_track.get("properties", {}).get("codec_id")
-        if codec not in SUPPORTED_SUBTITLE_CODECS:
+        if codec not in supported_codecs:
             logger.warning(
                 f"The only '{lang_code}' subtitle track is unsupported ({codec})."
             )
@@ -1007,7 +1081,7 @@ def choose_track_for_language(lang_code, lang_tracks):
 
     print(f"Found multiple '{lang_code}' subtitle tracks:")
     for idx, track in enumerate(lang_tracks, start=1):
-        print(f"  {idx}. {get_track_display_name(track)}")
+        print(f"  {idx}. {get_track_display_name(track, supported_codecs=supported_codecs)}")
 
     default_track = supported_tracks[0] if supported_tracks else lang_tracks[0]
     default_choice = str(lang_tracks.index(default_track) + 1)
@@ -1023,7 +1097,7 @@ def choose_track_for_language(lang_code, lang_tracks):
         if choice.isdigit() and 1 <= int(choice) <= len(lang_tracks):
             selected_track = lang_tracks[int(choice) - 1]
             codec = selected_track.get("properties", {}).get("codec_id")
-            if codec not in SUPPORTED_SUBTITLE_CODECS:
+            if codec not in supported_codecs:
                 print(
                     "That track format is not supported for translation. Choose another."
                 )
@@ -1045,6 +1119,23 @@ def get_supported_language_options(found_tracks, exclude=None):
             continue
         if any(
             track.get("properties", {}).get("codec_id") in SUPPORTED_SUBTITLE_CODECS
+            for track in lang_tracks
+        ):
+            supported_langs.append(lang)
+
+    return supported_langs
+
+
+def get_language_options_for_codecs(found_tracks, supported_codecs, exclude=None):
+    """Return languages that have at least one track using the requested codecs."""
+    exclude = exclude or set()
+    supported_langs = []
+
+    for lang, lang_tracks in found_tracks.items():
+        if lang in exclude:
+            continue
+        if any(
+            track.get("properties", {}).get("codec_id") in supported_codecs
             for track in lang_tracks
         ):
             supported_langs.append(lang)
@@ -1207,6 +1298,55 @@ def select_subtitle_tracks(
                 secondary_lang = None
 
     return primary_track, primary_lang, secondary_track, secondary_lang
+
+
+def get_ffmpeg_subtitle_stream_index(tracks, selected_track):
+    """Map an mkvmerge subtitle track to ffmpeg subtitle stream order."""
+    subtitle_tracks = [track for track in tracks if track.get("type") == "subtitles"]
+    for subtitle_index, track in enumerate(subtitle_tracks):
+        if track.get("id") == selected_track.get("id"):
+            return subtitle_index
+    raise ValueError("Could not map selected subtitle track to ffmpeg subtitle stream index")
+
+
+def select_ocr_subtitle_track(tracks, preferred_lang=None):
+    """Select an image subtitle track for OCR rendering when available."""
+    found_tracks = build_found_subtitle_tracks(tracks)
+    if not found_tracks:
+        return None, None, None
+
+    supported_langs = get_language_options_for_codecs(found_tracks, OCR_SUBTITLE_CODECS)
+    if not supported_langs:
+        return None, None, None
+
+    normalized_preferred = normalize_track_language(preferred_lang)
+    if normalized_preferred in supported_langs:
+        lang_code = normalized_preferred
+        logger.info(f"Using OCR subtitle language {lang_code} from --ocr-lang.")
+    elif len(supported_langs) == 1:
+        lang_code = supported_langs[0]
+    else:
+        default_lang = (
+            normalized_preferred
+            if normalized_preferred in supported_langs
+            else ("ja" if "ja" in supported_langs else supported_langs[0])
+        )
+        print(f"Found OCR-capable subtitle languages: {', '.join(supported_langs)}")
+        lang_code = prompt_subtitle_language(
+            found_tracks,
+            "Select subtitle language to OCR from",
+            default_lang=default_lang,
+            exclude={lang for lang in found_tracks if lang not in supported_langs},
+        )
+
+    track = choose_track_for_language(
+        lang_code, found_tracks[lang_code], supported_codecs=OCR_SUBTITLE_CODECS
+    )
+    if track is None:
+        return None, None, None
+
+    subtitle_stream_index = get_ffmpeg_subtitle_stream_index(tracks, track)
+    return track, lang_code, subtitle_stream_index
 
 
 def extract_subtitle_track(mkv_path, track, tmp_dir, lang_code, label=""):
@@ -3483,6 +3623,8 @@ def translate_ass_file(
             # Save logs
             logger.save_logs()
 
+            cleanup_tracked_processes()
+
             # Save progress (calculate current position accounting for partial success)
             if i > 0:
                 current_position = max(1, i - len(batch) + max(0, last_chunk_size - 1))
@@ -3954,6 +4096,566 @@ def merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_mkv_dir):
         return None
 
 
+def run_ocr_batch_ollama(
+    client,
+    model_name,
+    frame_batch,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Extract burned-in subtitle text from one image batch using Ollama vision."""
+    images = []
+    for sample in frame_batch:
+        images.append(base64.b64encode(sample.get_image_bytes()).decode("ascii"))
+
+    system_prompt = (
+        "You are an OCR extractor for burned-in subtitles. "
+        "Read subtitle text exactly as it appears in each image. "
+        "Do not translate, explain, or summarize. "
+        "Ignore logos, watermarks, UI, credits, and background scene details."
+    )
+    user_prompt = (
+        f"There are {len(frame_batch)} images attached in order from ordinal 0 to {len(frame_batch) - 1}. "
+        "Return a JSON object with one field named results. "
+        "results must be an array with exactly one object per image. "
+        "Each object must contain: ordinal (integer) and text (string). "
+        "If an image has no readable subtitle text, use an empty string for text. "
+        "Preserve subtitle line breaks using \\n inside the text field."
+    )
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ordinal": {"type": "integer"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["ordinal", "text"],
+                },
+            }
+        },
+        "required": ["results"],
+    }
+
+    options = {"temperature": 0}
+    if temperature is not None:
+        options["temperature"] = temperature
+    if top_p is not None:
+        options["top_p"] = top_p
+    if top_k is not None:
+        options["top_k"] = top_k
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt, "images": images},
+    ]
+
+    with suppress_stderr_output():
+        response = client.chat(
+            model=model_name,
+            messages=messages,
+            stream=False,
+            format=response_schema,
+            options=options,
+        )
+
+    response_text = extract_ollama_chunk_text(response)
+    if not response_text or not response_text.strip():
+        raise ValueError("OCR model returned an empty response")
+
+    parsed = json_repair.loads(response_text)
+    results = parsed.get("results") if isinstance(parsed, dict) else None
+    if not isinstance(results, list):
+        raise ValueError("OCR response did not contain a results array")
+
+    by_ordinal = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        ordinal = item.get("ordinal")
+        text = item.get("text")
+        if isinstance(ordinal, int) and isinstance(text, str):
+            by_ordinal[ordinal] = text
+
+    return [by_ordinal.get(i, "") for i in range(len(frame_batch))]
+
+
+def run_ocr_single_image_strict(
+    client,
+    model_name,
+    sample,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Retry OCR for a single image with a stricter prompt when empty text looks suspicious."""
+    image_b64 = base64.b64encode(sample.get_image_bytes()).decode("ascii")
+    system_prompt = (
+        "You are an OCR extractor for subtitle images. "
+        "If there is any visible subtitle text at all, transcribe it exactly. "
+        "Only return an empty string when the image truly contains no readable subtitle glyphs. "
+        "Do not translate or explain anything."
+    )
+    response_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+    options = {"temperature": 0}
+    if temperature is not None:
+        options["temperature"] = temperature
+    if top_p is not None:
+        options["top_p"] = top_p
+    if top_k is not None:
+        options["top_k"] = top_k
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": "Return JSON with one field named text. Preserve subtitle line breaks using \\n.",
+            "images": [image_b64],
+        },
+    ]
+
+    with suppress_stderr_output():
+        response = client.chat(
+            model=model_name,
+            messages=messages,
+            stream=False,
+            format=response_schema,
+            options=options,
+        )
+
+    response_text = extract_ollama_chunk_text(response)
+    parsed = json_repair.loads(response_text)
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+        return parsed["text"]
+    raise ValueError("Strict OCR response did not contain a text field")
+
+
+def repair_empty_ocr_results(
+    client,
+    model_name,
+    frame_batch,
+    texts,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Re-check empty OCR outputs one-by-one so visible subtitle lines are not lost silently."""
+    repaired = list(texts)
+    for idx, text in enumerate(repaired):
+        if text:
+            continue
+        try:
+            retried = run_ocr_single_image_strict(
+                client,
+                model_name,
+                frame_batch[idx],
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            repaired[idx] = retried
+        except Exception as exc:
+            logger.log_only(f"Strict OCR retry failed for one image: {exc}")
+    return repaired
+
+
+def run_ocr_batch_ollama_resilient(
+    client,
+    model_name,
+    frame_batch,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    retries_remaining=2,
+):
+    """Run OCR with automatic batch splitting when the model returns bad output."""
+    try:
+        texts = run_ocr_batch_ollama(
+            client,
+            model_name,
+            frame_batch,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        return repair_empty_ocr_results(
+            client,
+            model_name,
+            frame_batch,
+            texts,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+    except Exception as exc:
+        if retries_remaining > 0:
+            logger.log_only(
+                f"OCR batch of {len(frame_batch)} failed ({exc}). Retrying {retries_remaining} more time(s)."
+            )
+            time.sleep(2)
+            return run_ocr_batch_ollama_resilient(
+                client,
+                model_name,
+                frame_batch,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                retries_remaining=retries_remaining - 1,
+            )
+
+        if len(frame_batch) <= 1:
+            raise RuntimeError(
+                f"OCR failed for a single subtitle bitmap after retries: {exc}"
+            )
+
+        midpoint = max(1, len(frame_batch) // 2)
+        logger.log_only(
+            f"OCR batch of {len(frame_batch)} failed ({exc}). Retrying as {midpoint} + {len(frame_batch) - midpoint}."
+        )
+        left = run_ocr_batch_ollama_resilient(
+            client,
+            model_name,
+            frame_batch[:midpoint],
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            retries_remaining=2,
+        )
+        right = run_ocr_batch_ollama_resilient(
+            client,
+            model_name,
+            frame_batch[midpoint:],
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            retries_remaining=2,
+        )
+        return left + right
+
+
+def run_ocr_batch_with_progress(
+    client,
+    model_name,
+    frame_batch,
+    current,
+    total,
+    batch_index,
+    total_batches,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Run one OCR batch while keeping the OCR progress bar animated."""
+    stop_event = threading.Event()
+    start_time = time.time()
+    max_partial = max(0, len(frame_batch) - 1)
+
+    def get_partial_progress():
+        if max_partial <= 0:
+            return 0
+        elapsed = time.time() - start_time
+        # Smoothly advance the visible count within the current batch while waiting.
+        ramp_seconds = min(30.0, max(8.0, float(len(frame_batch))))
+        return min(max_partial, int((elapsed / ramp_seconds) * max_partial))
+
+    def heartbeat():
+        while not stop_event.wait(1):
+            progress_bar(
+                current=current,
+                total=total,
+                chunk_size=get_partial_progress(),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Reading subtitles",
+                task_label="OCR",
+            )
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+
+    try:
+        return run_ocr_batch_ollama_resilient(
+            client,
+            model_name,
+            frame_batch,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=0.2)
+
+
+def process_mkv_ocr_file(
+    mkv_path,
+    output_dir,
+    api_manager,
+    model_name,
+    audio_model_name,
+    ocr_lang,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+    ocr_fps=2.0,
+    ocr_crop=None,
+    ocr_full_frame=False,
+    ocr_frame_diff=5.0,
+    ocr_recheck_every=3,
+    ocr_request_batch_size=24,
+    ocr_extract_workers=None,
+):
+    """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
+    print(f"\n{'=' * 60}")
+    print(f"Processing with OCR: {mkv_path.name}")
+    print(f"{'=' * 60}\n")
+
+    expected_output_name = f"{mkv_path.stem}.translated.mkv"
+    expected_output_path = output_dir / expected_output_name
+    if expected_output_path.exists():
+        logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
+        return batch_size
+
+    if not is_ollama_provider(api_manager.provider):
+        logger.error("--ocr currently requires an Ollama provider with image support.")
+        return batch_size
+
+    if not check_ffmpeg_tools():
+        logger.error("ffmpeg and ffprobe are required for OCR mode.")
+        return batch_size
+
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
+    ocr_dir = tmp_dir / f"{mkv_path.stem}.ocr"
+    ocr_dir.mkdir(exist_ok=True)
+
+    try:
+        mkvmerge_cmd = ["mkvmerge", "-J", str(mkv_path)]
+        result = subprocess.run(
+            mkvmerge_cmd, check=True, capture_output=True, text=True, encoding="utf-8"
+        )
+        mkv_info = json.loads(result.stdout)
+        tracks = mkv_info.get("tracks", [])
+
+        ocr_track, selected_ocr_lang, subtitle_stream_index = select_ocr_subtitle_track(
+            tracks, preferred_lang=ocr_lang
+        )
+
+        width, height, _ = get_video_info(mkv_path)
+        crop_filter = resolve_ocr_crop_filter(
+            width, height, crop_spec=ocr_crop, full_frame=ocr_full_frame
+        )
+        if ocr_track is not None:
+            logger.log_only(
+                f"Rendering subtitle track id={ocr_track.get('id')} ({selected_ocr_lang}) directly into OCR bitmaps."
+            )
+            actual_frame_total = count_subtitle_bitmap_frames_full_stream(
+                mkv_path,
+                crop_filter,
+                subtitle_stream_index,
+            )
+            logger.log_only(
+                f"Detected {actual_frame_total} displayed subtitle frames for OCR extraction."
+            )
+
+            progress_bar(
+                current=0,
+                total=max(1, actual_frame_total),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Extracting OCR frames",
+                task_label="OCR",
+                count_text=f"0/{max(1, actual_frame_total)}",
+            )
+
+            def log_extraction_progress(done, total):
+                display_total = max(total, done + 1)
+                progress_bar(
+                    current=done,
+                    total=max(display_total, 1),
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Extracting OCR frames",
+                    task_label="OCR",
+                    count_text=f"{done}/{display_total}",
+                )
+
+            frame_samples = extract_subtitle_bitmap_frames_full_stream(
+                mkv_path,
+                crop_filter,
+                subtitle_stream_index,
+                expected_total=actual_frame_total,
+                progress_callback=log_extraction_progress,
+            )
+            progress_bar(
+                current=len(frame_samples),
+                total=max(len(frame_samples), 1),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Extracting OCR frames",
+                task_label="OCR",
+                count_text=f"{len(frame_samples)}/{len(frame_samples)}",
+            )
+            distinct_samples = select_distinct_image_samples(
+                frame_samples, recheck_every=ocr_recheck_every
+            )
+            logger.log_only(
+                f"Kept {len(distinct_samples)} distinct subtitle bitmaps after duplicate filtering."
+            )
+        else:
+            selected_ocr_lang = ocr_lang
+            logger.log_only(
+                "No OCR-capable subtitle track found. Falling back to direct video-frame OCR."
+            )
+            frame_samples = extract_ocr_frames(
+                mkv_path,
+                ocr_dir,
+                ocr_fps,
+                crop_filter,
+                subtitle_stream_index=subtitle_stream_index,
+            )
+            distinct_samples = select_distinct_frame_samples(
+                frame_samples,
+                diff_threshold=ocr_frame_diff,
+                recheck_every=ocr_recheck_every,
+            )
+        if not distinct_samples:
+            logger.error("No OCR frames were selected for analysis.")
+            return batch_size
+
+        logger.log_only(
+            f"OCR extracted {len(frame_samples)} sampled frames and kept {len(distinct_samples)} after similarity filtering."
+        )
+
+        progress_bar(
+            current=0,
+            total=len(distinct_samples),
+            model_name=model_name,
+            is_loading=True,
+            status_detail="Reading subtitles",
+            task_label="OCR",
+        )
+
+        client = api_manager.get_client()
+        ocr_text_cache = {}
+        total_batches = (len(distinct_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
+        for batch_index, start in enumerate(
+            range(0, len(distinct_samples), ocr_request_batch_size), start=1
+        ):
+            frame_batch = distinct_samples[start : start + ocr_request_batch_size]
+            progress_bar(
+                current=start,
+                total=len(distinct_samples),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Reading subtitles",
+                task_label="OCR",
+            )
+            batch_hashes = [
+                sample.get_image_hash()
+                for sample in frame_batch
+            ]
+            uncached_pairs = [
+                (sample, image_hash)
+                for sample, image_hash in zip(frame_batch, batch_hashes)
+                if image_hash not in ocr_text_cache
+            ]
+
+            if uncached_pairs:
+                uncached_texts = run_ocr_batch_with_progress(
+                    client,
+                    model_name,
+                    [sample for sample, _ in uncached_pairs],
+                    current=start,
+                    total=len(distinct_samples),
+                    batch_index=batch_index,
+                    total_batches=total_batches,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+                for (_, image_hash), text in zip(uncached_pairs, uncached_texts):
+                    ocr_text_cache[image_hash] = text
+
+            progress_bar(
+                current=min(start + len(frame_batch), len(distinct_samples)),
+                total=len(distinct_samples),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Reading subtitles",
+                task_label="OCR",
+            )
+            if batch_index == 1 or batch_index == total_batches or batch_index % 5 == 0:
+                logger.log_only(f"OCR batches completed: {batch_index}/{total_batches}")
+
+        observed_text = [
+            (sample.timestamp_s, ocr_text_cache.get(sample.get_image_hash(), ""))
+            for sample in frame_samples
+        ]
+
+        positive_gaps = [
+            later.timestamp_s - earlier.timestamp_s
+            for earlier, later in zip(frame_samples, frame_samples[1:])
+            if later.timestamp_s > earlier.timestamp_s
+        ]
+        sample_interval_s = statistics.median(positive_gaps) if positive_gaps else 0.25
+
+        source_subtitle_path = tmp_dir / f"{mkv_path.stem}.{selected_ocr_lang}.ocr.srt"
+        build_srt_from_ocr_results(
+            observed_text,
+            source_subtitle_path,
+            sample_interval_s=sample_interval_s,
+        )
+        logger.success(f"Created OCR subtitle file: {source_subtitle_path.name}")
+
+        translated_subtitle_path, final_batch_size = translate_ass_file(
+            source_subtitle_path,
+            api_manager,
+            model_name,
+            audio_model_name,
+            None,
+            None,
+            tmp_dir,
+            mkv_path.stem,
+            selected_ocr_lang,
+            ".srt",
+            batch_size,
+            thinking,
+            thinking_budget,
+            keep_original,
+            None,
+            False,
+            mkv_path,
+            free_quota,
+            temperature,
+            top_p,
+            top_k,
+            strip_sdh,
+        )
+
+        if translated_subtitle_path:
+            merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_dir)
+
+        return final_batch_size
+    except Exception as e:
+        logger.error(f"OCR processing failed for {mkv_path.name}: {e}")
+        return batch_size
+
+
 def process_mkv_file(
     mkv_path,
     output_dir,
@@ -4097,6 +4799,11 @@ def process_mkv_file(
 
 
 def main():
+    import signal
+
+    signal.signal(signal.SIGINT, handle_process_termination)
+    signal.signal(signal.SIGTERM, handle_process_termination)
+
     parser = argparse.ArgumentParser(
         description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini or Ollama.\n\n"
         "Usage:\n"
@@ -4192,6 +4899,55 @@ def main():
         "--add-original-only",
         action="store_true",
         help="Post-process existing translated ASS output and inject {Original: ...} comments from a chosen subtitle track, then rebuild the translated MKV.",
+    )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Use burned-in subtitle OCR instead of extracting subtitle tracks from the MKV.",
+    )
+    parser.add_argument(
+        "--ocr-lang",
+        default="eng",
+        help="Source language code to use for OCR subtitles before translation (default: eng).",
+    )
+    parser.add_argument(
+        "--ocr-crop",
+        help="Crop rectangle for OCR in x:y:w:h pixels. Defaults to the bottom third of the frame.",
+    )
+    parser.add_argument(
+        "--ocr-full-frame",
+        action="store_true",
+        help="Run OCR on the full video frame instead of the default bottom-third crop.",
+    )
+    parser.add_argument(
+        "--ocr-fps",
+        type=float,
+        default=2.0,
+        help="Frame sampling rate for OCR before similarity filtering (default: 2.0).",
+    )
+    parser.add_argument(
+        "--ocr-frame-diff",
+        type=float,
+        default=5.0,
+        help="Mean grayscale difference required to OCR a new sampled frame (default: 5.0).",
+    )
+    parser.add_argument(
+        "--ocr-recheck-every",
+        type=int,
+        default=3,
+        help="Force a fresh OCR check after this many skipped sampled frames (default: 3).",
+    )
+    parser.add_argument(
+        "--ocr-request-batch-size",
+        type=int,
+        default=24,
+        help="Number of OCR images to send in one multimodal model request (default: 24).",
+    )
+    parser.add_argument(
+        "--ocr-extract-workers",
+        type=int,
+        default=get_default_ocr_extract_workers(),
+        help="Number of parallel ffmpeg workers to use for sparse subtitle-frame extraction (default: auto).",
     )
     parser.add_argument(
         "-a",
@@ -4305,6 +5061,22 @@ def main():
         logger.error("ollama-cloud requires --model to be set explicitly")
         sys.exit(1)
 
+    if args.ocr_fps <= 0:
+        logger.error("ocr-fps must be greater than 0")
+        sys.exit(1)
+
+    if args.ocr_request_batch_size <= 0:
+        logger.error("ocr-request-batch-size must be greater than 0")
+        sys.exit(1)
+
+    if args.ocr_extract_workers <= 0:
+        logger.error("ocr-extract-workers must be greater than 0")
+        sys.exit(1)
+
+    if args.ocr_recheck_every < 0:
+        logger.error("ocr-recheck-every must be 0 or greater")
+        sys.exit(1)
+
     # Handle thinking mode flags
     if args.no_thinking:
         args.thinking = False
@@ -4316,7 +5088,7 @@ def main():
             )
         args.thinking = False
 
-        if args.audio_file or args.extract_audio:
+        if (args.audio_file or args.extract_audio) and not args.ocr:
             logger.warning(
                 "Audio-assisted translation is currently only supported with Gemini. Continuing without audio input."
             )
@@ -4441,6 +5213,10 @@ def main():
             )
         sys.exit(1)
 
+    if args.ocr and not is_ollama_provider(args.provider):
+        logger.error("--ocr currently requires an Ollama provider with image support.")
+        sys.exit(1)
+
     # Handle --list-models before checking other args
     if args.list_models:
         try:
@@ -4489,30 +5265,57 @@ def main():
             # Set free_quota based on paid_quota flag (inverted logic)
             free_quota = not args.paid_quota
 
-            chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
-                file_path,
-                args.output_dir,
-                api_manager,
-                args.model,
-                args.audio_model,
-                remembered_lang,
-                remembered_secondary_lang,
-                remembered_batch_size,
-                args.thinking,
-                args.thinking_budget,
-                args.keep_original,
-                args.audio_file,
-                args.extract_audio,
-                free_quota,
-                args.temperature,
-                args.top_p,
-                args.top_k,
-                args.strip_sdh,
-            )
-            # Remember language selection for subsequent files
-            if chosen_lang:
-                remembered_lang = chosen_lang
-            remembered_secondary_lang = chosen_secondary_lang
+            if args.ocr:
+                final_batch_size = process_mkv_ocr_file(
+                    file_path,
+                    args.output_dir,
+                    api_manager,
+                    args.model,
+                    args.audio_model,
+                    args.ocr_lang,
+                    remembered_batch_size,
+                    args.thinking,
+                    args.thinking_budget,
+                    args.keep_original,
+                    free_quota,
+                    args.temperature,
+                    args.top_p,
+                    args.top_k,
+                    args.strip_sdh,
+                    args.ocr_fps,
+                    args.ocr_crop,
+                    args.ocr_full_frame,
+                    args.ocr_frame_diff,
+                    args.ocr_recheck_every,
+                    args.ocr_request_batch_size,
+                    args.ocr_extract_workers,
+                )
+            else:
+                chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
+                    file_path,
+                    args.output_dir,
+                    api_manager,
+                    args.model,
+                    args.audio_model,
+                    remembered_lang,
+                    remembered_secondary_lang,
+                    remembered_batch_size,
+                    args.thinking,
+                    args.thinking_budget,
+                    args.keep_original,
+                    args.audio_file,
+                    args.extract_audio,
+                    free_quota,
+                    args.temperature,
+                    args.top_p,
+                    args.top_k,
+                    args.strip_sdh,
+                )
+                # Remember language selection for subsequent files
+                if chosen_lang:
+                    remembered_lang = chosen_lang
+                remembered_secondary_lang = chosen_secondary_lang
+
             # Remember batch size adjustment for subsequent files
             if final_batch_size and final_batch_size != remembered_batch_size:
                 logger.info(
