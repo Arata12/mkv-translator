@@ -116,6 +116,12 @@ OCR hardcoded subtitles with Ollama Gemma:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
 ```
 
+Limit OCR to the first 20 subtitle images for testing:
+
+```bash
+python3 translator.py --ocr --ocr-lang eng --ocr-max-items 20 video.mkv
+```
+
 Run diagnostics:
 
 ```bash
@@ -169,6 +175,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--ocr-frame-diff FLOAT` - minimum grayscale change before re-running OCR on a sampled frame
 - `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
 - `--ocr-request-batch-size N` - number of images per OCR model request
+- `--ocr-max-items N` - limit OCR to the first N extracted subtitle samples for testing
 - `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
@@ -200,6 +207,10 @@ By default, files are written to `translated_subs/`:
 - Audio-aware translation is mainly useful for gendered languages like Spanish
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
 - OCR mode currently uses Ollama vision models and is best treated as experimental
-- OCR mode samples subtitle events directly for image subtitle tracks like PGS instead of scanning the whole video
+- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
+- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
+- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
+- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
+- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
 - GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages

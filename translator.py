@@ -12,6 +12,7 @@ import base64
 import contextlib
 import io
 import logging
+import math
 import os
 import statistics
 import sys
@@ -71,10 +72,20 @@ try:
         resolve_ocr_crop_filter,
         select_distinct_frame_samples,
         select_distinct_image_samples,
+        _load_ocr_extract_cache,
+        _save_ocr_extract_cache,
     )
 except ImportError:
     logging.error(
         "ocr_utils module not found. Please ensure tools/ocr_utils.py is available."
+    )
+    sys.exit(1)
+
+try:
+    from tools.ocr_review_webui import review_ocr_text_in_webui
+except ImportError:
+    logging.error(
+        "ocr_review_webui module not found. Please ensure tools/ocr_review_webui.py is available."
     )
     sys.exit(1)
 
@@ -995,7 +1006,11 @@ def prompt_yes_no(prompt, default=False):
     default_text = "Y/n" if default else "y/N"
 
     while True:
-        choice = input(f"{prompt} [{default_text}]: ").strip().lower()
+        try:
+            choice = input(f"{prompt} [{default_text}]: ").strip().lower()
+        except EOFError:
+            print()
+            return default
         if not choice:
             return default
         if choice in {"y", "yes", "s", "si"}:
@@ -1347,6 +1362,51 @@ def select_ocr_subtitle_track(tracks, preferred_lang=None):
 
     subtitle_stream_index = get_ffmpeg_subtitle_stream_index(tracks, track)
     return track, lang_code, subtitle_stream_index
+
+
+def get_ocr_review_session_file(mkv_path):
+    return Path("tmp") / f"{mkv_path.stem}.ocr-review" / "session.json"
+
+
+def load_saved_ocr_text_cache(mkv_path, samples):
+    session_file = get_ocr_review_session_file(mkv_path)
+    if not session_file.exists():
+        return {}
+
+    expected_source_indexes = [getattr(sample, "index", position) for position, sample in enumerate(samples)]
+
+    try:
+        with open(session_file, "r", encoding="utf-8") as handle:
+            session_data = json.load(handle)
+    except Exception as exc:
+        logger.warning(f"Failed to load saved OCR review session: {exc}")
+        return {}
+
+    if session_data.get("input_file") != str(mkv_path):
+        return {}
+
+    items = session_data.get("items", [])
+    saved_source_indexes = []
+    for position, item in enumerate(items):
+        source_indexes = item.get("source_indexes")
+        if source_indexes:
+            saved_source_indexes.extend(source_indexes)
+        else:
+            saved_source_indexes.append(item.get("source_index", position))
+
+    if saved_source_indexes != expected_source_indexes:
+        return {}
+
+    saved_text_cache = {}
+    for position, item in enumerate(items):
+        source_indexes = item.get("source_indexes") or [item.get("source_index", position)]
+        item_text = item.get("original_text", item.get("text", ""))
+        for source_index in source_indexes:
+            if source_index is None:
+                continue
+            saved_text_cache[source_index] = item_text
+
+    return saved_text_cache
 
 
 def extract_subtitle_track(mkv_path, track, tmp_dir, lang_code, label=""):
@@ -4418,6 +4478,7 @@ def process_mkv_ocr_file(
     ocr_recheck_every=3,
     ocr_request_batch_size=24,
     ocr_extract_workers=None,
+    ocr_max_items=None,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
     print(f"\n{'=' * 60}")
@@ -4455,7 +4516,7 @@ def process_mkv_ocr_file(
             tracks, preferred_lang=ocr_lang
         )
 
-        width, height, _ = get_video_info(mkv_path)
+        width, height, duration_s = get_video_info(mkv_path)
         crop_filter = resolve_ocr_crop_filter(
             width, height, crop_spec=ocr_crop, full_frame=ocr_full_frame
         )
@@ -4472,107 +4533,222 @@ def process_mkv_ocr_file(
                 f"Detected {actual_frame_total} displayed subtitle frames for OCR extraction."
             )
 
-            progress_bar(
-                current=0,
-                total=max(1, actual_frame_total),
-                model_name=model_name,
-                is_loading=True,
-                status_detail="Extracting OCR frames",
-                task_label="OCR",
-                count_text=f"0/{max(1, actual_frame_total)}",
+            cached_samples = _load_ocr_extract_cache(
+                mkv_path,
+                crop_filter=crop_filter,
+                ocr_mode="subtitle_bitmap",
+                ocr_fps=None,
+                subtitle_stream_index=subtitle_stream_index,
             )
-
-            def log_extraction_progress(done, total):
-                display_total = max(total, done + 1)
+            if cached_samples is not None:
+                logger.info("Reusing cached OCR frame extraction for subtitle bitmap mode.")
+                frame_samples = cached_samples
                 progress_bar(
-                    current=done,
-                    total=max(display_total, 1),
+                    current=len(frame_samples),
+                    total=max(len(frame_samples), 1),
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Loading cached OCR frames",
+                    task_label="OCR",
+                    count_text=f"{len(frame_samples)}/{len(frame_samples)}",
+                )
+            else:
+                progress_bar(
+                    current=0,
+                    total=max(1, actual_frame_total),
                     model_name=model_name,
                     is_loading=True,
                     status_detail="Extracting OCR frames",
                     task_label="OCR",
-                    count_text=f"{done}/{display_total}",
+                    count_text=f"0/{max(1, actual_frame_total)}",
                 )
 
-            frame_samples = extract_subtitle_bitmap_frames_full_stream(
-                mkv_path,
-                crop_filter,
-                subtitle_stream_index,
-                expected_total=actual_frame_total,
-                progress_callback=log_extraction_progress,
-            )
-            progress_bar(
-                current=len(frame_samples),
-                total=max(len(frame_samples), 1),
-                model_name=model_name,
-                is_loading=True,
-                status_detail="Extracting OCR frames",
-                task_label="OCR",
-                count_text=f"{len(frame_samples)}/{len(frame_samples)}",
-            )
-            distinct_samples = select_distinct_image_samples(
-                frame_samples, recheck_every=ocr_recheck_every
-            )
+                def log_extraction_progress(done, total):
+                    display_total = max(total, done + 1)
+                    progress_bar(
+                        current=done,
+                        total=max(display_total, 1),
+                        model_name=model_name,
+                        is_loading=True,
+                        status_detail="Extracting OCR frames",
+                        task_label="OCR",
+                        count_text=f"{done}/{display_total}",
+                    )
+
+                frame_samples = extract_subtitle_bitmap_frames_full_stream(
+                    mkv_path,
+                    crop_filter,
+                    subtitle_stream_index,
+                    expected_total=actual_frame_total,
+                    progress_callback=log_extraction_progress,
+                )
+                progress_bar(
+                    current=len(frame_samples),
+                    total=max(len(frame_samples), 1),
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Extracting OCR frames",
+                    task_label="OCR",
+                    count_text=f"{len(frame_samples)}/{len(frame_samples)}",
+                )
+                _save_ocr_extract_cache(
+                    mkv_path,
+                    crop_filter=crop_filter,
+                    ocr_mode="subtitle_bitmap",
+                    ocr_fps=None,
+                    subtitle_stream_index=subtitle_stream_index,
+                    frame_samples=frame_samples,
+                )
+                logger.info("Saved OCR frame extraction to cache for future reuse.")
+
+            ocr_samples = list(frame_samples)
             logger.log_only(
-                f"Kept {len(distinct_samples)} distinct subtitle bitmaps after duplicate filtering."
+                f"Prepared {len(ocr_samples)} subtitle bitmap frames for OCR without deduplication."
             )
         else:
             selected_ocr_lang = ocr_lang
-            logger.log_only(
-                "No OCR-capable subtitle track found. Falling back to direct video-frame OCR."
+            logger.warning(
+                "No OCR-capable subtitle track found for direct subtitle rendering."
             )
-            frame_samples = extract_ocr_frames(
+            if not prompt_yes_no(
+                "Continue with slower full video-frame OCR extraction? This can take a while",
+                default=False,
+            ):
+                logger.info("OCR cancelled before full video-frame extraction.")
+                return batch_size
+
+            logger.log_only(
+                "Falling back to direct video-frame OCR after user confirmation."
+            )
+            estimated_frame_total = max(1, math.ceil(duration_s * ocr_fps))
+            extraction_total = max(estimated_frame_total * 2, 1)
+
+            cached_samples = _load_ocr_extract_cache(
                 mkv_path,
-                ocr_dir,
-                ocr_fps,
-                crop_filter,
+                crop_filter=crop_filter,
+                ocr_mode="video_frame",
+                ocr_fps=ocr_fps,
                 subtitle_stream_index=subtitle_stream_index,
             )
-            distinct_samples = select_distinct_frame_samples(
-                frame_samples,
-                diff_threshold=ocr_frame_diff,
-                recheck_every=ocr_recheck_every,
+            if cached_samples is not None:
+                logger.info("Reusing cached OCR frame extraction for video-frame mode.")
+                frame_samples = cached_samples
+                progress_bar(
+                    current=extraction_total,
+                    total=extraction_total,
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Loading cached OCR frames",
+                    task_label="OCR",
+                    count_text=f"{extraction_total}/{extraction_total}",
+                )
+            else:
+                progress_bar(
+                    current=0,
+                    total=extraction_total,
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Extracting OCR frames",
+                    task_label="OCR",
+                    count_text=f"0/{extraction_total}",
+                )
+                fallback_progress_total = extraction_total
+
+                def log_fallback_extraction_progress(done, total):
+                    nonlocal fallback_progress_total
+                    fallback_progress_total = max(total, done, 1)
+                    progress_bar(
+                        current=done,
+                        total=fallback_progress_total,
+                        model_name=model_name,
+                        is_loading=True,
+                        status_detail="Extracting OCR frames",
+                        task_label="OCR",
+                        count_text=f"{done}/{fallback_progress_total}",
+                    )
+
+                frame_samples = extract_ocr_frames(
+                    mkv_path,
+                    ocr_dir,
+                    ocr_fps,
+                    crop_filter,
+                    subtitle_stream_index=subtitle_stream_index,
+                    expected_total=estimated_frame_total,
+                    progress_callback=log_fallback_extraction_progress,
+                )
+                progress_bar(
+                    current=fallback_progress_total,
+                    total=fallback_progress_total,
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Extracting OCR frames",
+                    task_label="OCR",
+                    count_text=f"{fallback_progress_total}/{fallback_progress_total}",
+                )
+                _save_ocr_extract_cache(
+                    mkv_path,
+                    crop_filter=crop_filter,
+                    ocr_mode="video_frame",
+                    ocr_fps=ocr_fps,
+                    subtitle_stream_index=subtitle_stream_index,
+                    frame_samples=frame_samples,
+                )
+                logger.info("Saved OCR frame extraction to cache for future reuse.")
+
+            ocr_samples = list(frame_samples)
+            logger.log_only(
+                f"Prepared {len(ocr_samples)} sampled video frames for OCR without deduplication."
             )
-        if not distinct_samples:
+        if not ocr_samples:
             logger.error("No OCR frames were selected for analysis.")
             return batch_size
 
+        if ocr_max_items is not None and len(ocr_samples) > ocr_max_items:
+            ocr_samples = ocr_samples[:ocr_max_items]
+            allowed_indexes = {sample.index for sample in ocr_samples}
+            frame_samples = [sample for sample in frame_samples if sample.index in allowed_indexes]
+            logger.warning(
+                f"OCR test limit enabled: processing only the first {len(ocr_samples)} OCR samples."
+            )
+
         logger.log_only(
-            f"OCR extracted {len(frame_samples)} sampled frames and kept {len(distinct_samples)} after similarity filtering."
+            f"OCR extracted {len(frame_samples)} sampled frames and will OCR all {len(ocr_samples)} samples."
         )
 
+        ocr_text_cache = load_saved_ocr_text_cache(mkv_path, ocr_samples)
+        cached_distinct_count = len(ocr_text_cache)
+        if cached_distinct_count:
+            logger.info(
+                f"Reusing saved OCR results for {cached_distinct_count}/{len(ocr_samples)} OCR samples."
+            )
+
         progress_bar(
-            current=0,
-            total=len(distinct_samples),
+            current=min(cached_distinct_count, len(ocr_samples)),
+            total=len(ocr_samples),
             model_name=model_name,
             is_loading=True,
             status_detail="Reading subtitles",
             task_label="OCR",
         )
 
-        client = api_manager.get_client()
-        ocr_text_cache = {}
-        total_batches = (len(distinct_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
+        client = api_manager.get_client() if cached_distinct_count < len(ocr_samples) else None
+        total_batches = (len(ocr_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
         for batch_index, start in enumerate(
-            range(0, len(distinct_samples), ocr_request_batch_size), start=1
+            range(0, len(ocr_samples), ocr_request_batch_size), start=1
         ):
-            frame_batch = distinct_samples[start : start + ocr_request_batch_size]
+            frame_batch = ocr_samples[start : start + ocr_request_batch_size]
             progress_bar(
                 current=start,
-                total=len(distinct_samples),
+                total=len(ocr_samples),
                 model_name=model_name,
                 is_loading=True,
                 status_detail="Reading subtitles",
                 task_label="OCR",
             )
-            batch_hashes = [
-                sample.get_image_hash()
-                for sample in frame_batch
-            ]
             uncached_pairs = [
-                (sample, image_hash)
-                for sample, image_hash in zip(frame_batch, batch_hashes)
-                if image_hash not in ocr_text_cache
+                (sample, sample.index)
+                for sample in frame_batch
+                if sample.index not in ocr_text_cache
             ]
 
             if uncached_pairs:
@@ -4581,7 +4757,7 @@ def process_mkv_ocr_file(
                     model_name,
                     [sample for sample, _ in uncached_pairs],
                     current=start,
-                    total=len(distinct_samples),
+                    total=len(ocr_samples),
                     batch_index=batch_index,
                     total_batches=total_batches,
                     temperature=temperature,
@@ -4592,8 +4768,8 @@ def process_mkv_ocr_file(
                     ocr_text_cache[image_hash] = text
 
             progress_bar(
-                current=min(start + len(frame_batch), len(distinct_samples)),
-                total=len(distinct_samples),
+                current=min(start + len(frame_batch), len(ocr_samples)),
+                total=len(ocr_samples),
                 model_name=model_name,
                 is_loading=True,
                 status_detail="Reading subtitles",
@@ -4603,7 +4779,20 @@ def process_mkv_ocr_file(
                 logger.log_only(f"OCR batches completed: {batch_index}/{total_batches}")
 
         observed_text = [
-            (sample.timestamp_s, ocr_text_cache.get(sample.get_image_hash(), ""))
+            (sample.timestamp_s, ocr_text_cache.get(sample.index, ""))
+            for sample in frame_samples
+        ]
+
+        logger.info("Opening OCR review UI before subtitle translation...")
+        corrected_text_cache = review_ocr_text_in_webui(
+            mkv_path=mkv_path,
+            distinct_samples=ocr_samples,
+            initial_text_by_hash=ocr_text_cache,
+            logger=logger,
+        )
+
+        observed_text = [
+            (sample.timestamp_s, corrected_text_cache.get(sample.index, ""))
             for sample in frame_samples
         ]
 
@@ -4944,6 +5133,12 @@ def main():
         help="Number of OCR images to send in one multimodal model request (default: 24).",
     )
     parser.add_argument(
+        "--ocr-max-items",
+        type=int,
+        default=None,
+        help="Limit OCR to the first N distinct subtitle images for testing/resume checks.",
+    )
+    parser.add_argument(
         "--ocr-extract-workers",
         type=int,
         default=get_default_ocr_extract_workers(),
@@ -5067,6 +5262,10 @@ def main():
 
     if args.ocr_request_batch_size <= 0:
         logger.error("ocr-request-batch-size must be greater than 0")
+        sys.exit(1)
+
+    if args.ocr_max_items is not None and args.ocr_max_items <= 0:
+        logger.error("ocr-max-items must be greater than 0")
         sys.exit(1)
 
     if args.ocr_extract_workers <= 0:
@@ -5289,6 +5488,7 @@ def main():
                     args.ocr_recheck_every,
                     args.ocr_request_batch_size,
                     args.ocr_extract_workers,
+                    args.ocr_max_items,
                 )
             else:
                 chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
