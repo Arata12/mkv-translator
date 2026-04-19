@@ -65,10 +65,12 @@ try:
         check_ffmpeg_tools,
         count_subtitle_bitmap_frames_full_stream,
         extract_ocr_frames,
+        extract_raw_pgs_frames_full_stream,
         extract_subtitle_bitmap_frames_full_stream,
         extract_subtitle_bitmap_frames_at_timestamps,
         get_default_ocr_extract_workers,
         get_video_info,
+        parse_canvas_size,
         resolve_ocr_crop_filter,
         select_distinct_frame_samples,
         select_distinct_image_samples,
@@ -422,6 +424,34 @@ def resolve_mkv_input_files(input_path):
     if input_path.is_dir():
         logger.info(f"Searching for .mkv files in: {input_path.resolve()}")
         return sorted(list(input_path.glob("*.mkv")))
+
+    raise ValueError(f"Path does not exist: {input_path}")
+
+
+def resolve_input_files(input_path):
+    """Resolve a file or directory input into supported MKV/raw subtitle files."""
+    if not input_path:
+        raise ValueError(
+            "You must provide a path to an .mkv, .ass, .ssa, .srt, .sup file or directory."
+        )
+
+    if input_path.is_file():
+        if input_path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS:
+            logging.debug(f"Processing single input file: {input_path.resolve()}")
+            return [input_path]
+        raise ValueError(
+            f"Unsupported input file: {input_path}. Supported: .mkv, .ass, .ssa, .srt, .sup"
+        )
+
+    if input_path.is_dir():
+        logger.info(f"Searching for supported input files in: {input_path.resolve()}")
+        return sorted(
+            [
+                entry
+                for entry in input_path.iterdir()
+                if entry.is_file() and entry.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
+            ]
+        )
 
     raise ValueError(f"Path does not exist: {input_path}")
 
@@ -976,6 +1006,10 @@ SUPPORTED_SUBTITLE_CODECS = {
 }
 
 OCR_SUBTITLE_CODECS = {"S_HDMV/PGS"}
+RAW_TEXT_SUBTITLE_EXTENSIONS = {".ass", ".ssa", ".srt"}
+RAW_OCR_SUBTITLE_EXTENSIONS = {".sup"}
+SUPPORTED_INPUT_EXTENSIONS = {".mkv"} | RAW_TEXT_SUBTITLE_EXTENSIONS | RAW_OCR_SUBTITLE_EXTENSIONS
+DEFAULT_RAW_PGS_CANVAS_SIZE = "1920x1080"
 
 
 def normalize_track_language(lang_code):
@@ -999,6 +1033,18 @@ def normalize_track_language(lang_code):
         "french": "fr",
     }
     return aliases.get(normalized, normalized)
+
+
+def is_mkv_path(input_path):
+    return input_path.suffix.lower() == ".mkv"
+
+
+def is_raw_text_subtitle_path(input_path):
+    return input_path.suffix.lower() in RAW_TEXT_SUBTITLE_EXTENSIONS
+
+
+def is_raw_ocr_subtitle_path(input_path):
+    return input_path.suffix.lower() in RAW_OCR_SUBTITLE_EXTENSIONS
 
 
 def prompt_yes_no(prompt, default=False):
@@ -4452,7 +4498,177 @@ def run_ocr_batch_with_progress(
         )
     finally:
         stop_event.set()
-        heartbeat_thread.join(timeout=0.2)
+        animation_thread.join(timeout=1)
+
+
+def finalize_ocr_translation(
+    input_path,
+    output_dir,
+    api_manager,
+    model_name,
+    audio_model_name,
+    selected_ocr_lang,
+    frame_samples,
+    ocr_samples,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+    ocr_request_batch_size=24,
+    ocr_max_items=None,
+    merge_target_mkv=None,
+):
+    """OCR sampled subtitle images, build an SRT, and optionally merge it into an MKV."""
+    if not frame_samples or not ocr_samples:
+        logger.error("No OCR frames were selected for analysis.")
+        return batch_size
+
+    tmp_dir = Path("tmp")
+    tmp_dir.mkdir(exist_ok=True)
+
+    if ocr_max_items is not None and len(ocr_samples) > ocr_max_items:
+        ocr_samples = ocr_samples[:ocr_max_items]
+        allowed_indexes = {sample.index for sample in ocr_samples}
+        frame_samples = [sample for sample in frame_samples if sample.index in allowed_indexes]
+        logger.warning(
+            f"OCR test limit enabled: processing only the first {len(ocr_samples)} OCR samples."
+        )
+
+    logger.log_only(
+        f"OCR extracted {len(frame_samples)} sampled frames and will OCR all {len(ocr_samples)} samples."
+    )
+
+    ocr_text_cache = load_saved_ocr_text_cache(input_path, ocr_samples)
+    cached_distinct_count = len(ocr_text_cache)
+    if cached_distinct_count:
+        logger.info(
+            f"Reusing saved OCR results for {cached_distinct_count}/{len(ocr_samples)} OCR samples."
+        )
+
+    progress_bar(
+        current=min(cached_distinct_count, len(ocr_samples)),
+        total=len(ocr_samples),
+        model_name=model_name,
+        is_loading=True,
+        status_detail="Reading subtitles",
+        task_label="OCR",
+    )
+
+    client = api_manager.get_client() if cached_distinct_count < len(ocr_samples) else None
+    total_batches = (len(ocr_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
+    for batch_index, start in enumerate(
+        range(0, len(ocr_samples), ocr_request_batch_size), start=1
+    ):
+        frame_batch = ocr_samples[start : start + ocr_request_batch_size]
+        progress_bar(
+            current=start,
+            total=len(ocr_samples),
+            model_name=model_name,
+            is_loading=True,
+            status_detail="Reading subtitles",
+            task_label="OCR",
+        )
+        uncached_pairs = [
+            (sample, sample.index)
+            for sample in frame_batch
+            if sample.index not in ocr_text_cache
+        ]
+
+        if uncached_pairs:
+            uncached_texts = run_ocr_batch_with_progress(
+                client,
+                model_name,
+                [sample for sample, _ in uncached_pairs],
+                current=start,
+                total=len(ocr_samples),
+                batch_index=batch_index,
+                total_batches=total_batches,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+            for (_, image_hash), text in zip(uncached_pairs, uncached_texts):
+                ocr_text_cache[image_hash] = text
+
+        progress_bar(
+            current=min(start + len(frame_batch), len(ocr_samples)),
+            total=len(ocr_samples),
+            model_name=model_name,
+            is_loading=True,
+            status_detail="Reading subtitles",
+            task_label="OCR",
+        )
+        if batch_index == 1 or batch_index == total_batches or batch_index % 5 == 0:
+            logger.log_only(f"OCR batches completed: {batch_index}/{total_batches}")
+
+    observed_text = [
+        (sample.timestamp_s, ocr_text_cache.get(sample.index, ""))
+        for sample in frame_samples
+    ]
+
+    logger.info("Opening OCR review UI before subtitle translation...")
+    corrected_text_cache = review_ocr_text_in_webui(
+        mkv_path=input_path,
+        distinct_samples=ocr_samples,
+        initial_text_by_hash=ocr_text_cache,
+        logger=logger,
+    )
+
+    observed_text = [
+        (sample.timestamp_s, corrected_text_cache.get(sample.index, ""))
+        for sample in frame_samples
+    ]
+
+    positive_gaps = [
+        later.timestamp_s - earlier.timestamp_s
+        for earlier, later in zip(frame_samples, frame_samples[1:])
+        if later.timestamp_s > earlier.timestamp_s
+    ]
+    sample_interval_s = statistics.median(positive_gaps) if positive_gaps else 0.25
+
+    source_subtitle_path = tmp_dir / f"{input_path.stem}.{selected_ocr_lang}.ocr.srt"
+    build_srt_from_ocr_results(
+        observed_text,
+        source_subtitle_path,
+        sample_interval_s=sample_interval_s,
+    )
+    logger.success(f"Created OCR subtitle file: {source_subtitle_path.name}")
+
+    translation_output_dir = tmp_dir if merge_target_mkv else output_dir
+    translated_subtitle_path, final_batch_size = translate_ass_file(
+        source_subtitle_path,
+        api_manager,
+        model_name,
+        audio_model_name,
+        None,
+        None,
+        translation_output_dir,
+        input_path.stem,
+        selected_ocr_lang,
+        ".srt",
+        batch_size,
+        thinking,
+        thinking_budget,
+        keep_original,
+        None,
+        False,
+        merge_target_mkv,
+        free_quota,
+        temperature,
+        top_p,
+        top_k,
+        strip_sdh,
+    )
+
+    if translated_subtitle_path and merge_target_mkv:
+        merge_subtitles_to_mkv(merge_target_mkv, translated_subtitle_path, output_dir)
+
+    return final_batch_size
 
 
 def process_mkv_ocr_file(
@@ -4699,149 +4915,253 @@ def process_mkv_ocr_file(
             logger.log_only(
                 f"Prepared {len(ocr_samples)} sampled video frames for OCR without deduplication."
             )
-        if not ocr_samples:
-            logger.error("No OCR frames were selected for analysis.")
-            return batch_size
-
-        if ocr_max_items is not None and len(ocr_samples) > ocr_max_items:
-            ocr_samples = ocr_samples[:ocr_max_items]
-            allowed_indexes = {sample.index for sample in ocr_samples}
-            frame_samples = [sample for sample in frame_samples if sample.index in allowed_indexes]
-            logger.warning(
-                f"OCR test limit enabled: processing only the first {len(ocr_samples)} OCR samples."
-            )
-
-        logger.log_only(
-            f"OCR extracted {len(frame_samples)} sampled frames and will OCR all {len(ocr_samples)} samples."
-        )
-
-        ocr_text_cache = load_saved_ocr_text_cache(mkv_path, ocr_samples)
-        cached_distinct_count = len(ocr_text_cache)
-        if cached_distinct_count:
-            logger.info(
-                f"Reusing saved OCR results for {cached_distinct_count}/{len(ocr_samples)} OCR samples."
-            )
-
-        progress_bar(
-            current=min(cached_distinct_count, len(ocr_samples)),
-            total=len(ocr_samples),
-            model_name=model_name,
-            is_loading=True,
-            status_detail="Reading subtitles",
-            task_label="OCR",
-        )
-
-        client = api_manager.get_client() if cached_distinct_count < len(ocr_samples) else None
-        total_batches = (len(ocr_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
-        for batch_index, start in enumerate(
-            range(0, len(ocr_samples), ocr_request_batch_size), start=1
-        ):
-            frame_batch = ocr_samples[start : start + ocr_request_batch_size]
-            progress_bar(
-                current=start,
-                total=len(ocr_samples),
-                model_name=model_name,
-                is_loading=True,
-                status_detail="Reading subtitles",
-                task_label="OCR",
-            )
-            uncached_pairs = [
-                (sample, sample.index)
-                for sample in frame_batch
-                if sample.index not in ocr_text_cache
-            ]
-
-            if uncached_pairs:
-                uncached_texts = run_ocr_batch_with_progress(
-                    client,
-                    model_name,
-                    [sample for sample, _ in uncached_pairs],
-                    current=start,
-                    total=len(ocr_samples),
-                    batch_index=batch_index,
-                    total_batches=total_batches,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                )
-                for (_, image_hash), text in zip(uncached_pairs, uncached_texts):
-                    ocr_text_cache[image_hash] = text
-
-            progress_bar(
-                current=min(start + len(frame_batch), len(ocr_samples)),
-                total=len(ocr_samples),
-                model_name=model_name,
-                is_loading=True,
-                status_detail="Reading subtitles",
-                task_label="OCR",
-            )
-            if batch_index == 1 or batch_index == total_batches or batch_index % 5 == 0:
-                logger.log_only(f"OCR batches completed: {batch_index}/{total_batches}")
-
-        observed_text = [
-            (sample.timestamp_s, ocr_text_cache.get(sample.index, ""))
-            for sample in frame_samples
-        ]
-
-        logger.info("Opening OCR review UI before subtitle translation...")
-        corrected_text_cache = review_ocr_text_in_webui(
-            mkv_path=mkv_path,
-            distinct_samples=ocr_samples,
-            initial_text_by_hash=ocr_text_cache,
-            logger=logger,
-        )
-
-        observed_text = [
-            (sample.timestamp_s, corrected_text_cache.get(sample.index, ""))
-            for sample in frame_samples
-        ]
-
-        positive_gaps = [
-            later.timestamp_s - earlier.timestamp_s
-            for earlier, later in zip(frame_samples, frame_samples[1:])
-            if later.timestamp_s > earlier.timestamp_s
-        ]
-        sample_interval_s = statistics.median(positive_gaps) if positive_gaps else 0.25
-
-        source_subtitle_path = tmp_dir / f"{mkv_path.stem}.{selected_ocr_lang}.ocr.srt"
-        build_srt_from_ocr_results(
-            observed_text,
-            source_subtitle_path,
-            sample_interval_s=sample_interval_s,
-        )
-        logger.success(f"Created OCR subtitle file: {source_subtitle_path.name}")
-
-        translated_subtitle_path, final_batch_size = translate_ass_file(
-            source_subtitle_path,
+        return finalize_ocr_translation(
+            mkv_path,
+            output_dir,
             api_manager,
             model_name,
             audio_model_name,
-            None,
-            None,
-            tmp_dir,
-            mkv_path.stem,
             selected_ocr_lang,
-            ".srt",
-            batch_size,
-            thinking,
-            thinking_budget,
-            keep_original,
-            None,
-            False,
-            mkv_path,
-            free_quota,
-            temperature,
-            top_p,
-            top_k,
-            strip_sdh,
+            frame_samples,
+            ocr_samples,
+            batch_size=batch_size,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
+            keep_original=keep_original,
+            free_quota=free_quota,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            strip_sdh=strip_sdh,
+            ocr_request_batch_size=ocr_request_batch_size,
+            ocr_max_items=ocr_max_items,
+            merge_target_mkv=mkv_path,
         )
-
-        if translated_subtitle_path:
-            merge_subtitles_to_mkv(mkv_path, translated_subtitle_path, output_dir)
-
-        return final_batch_size
     except Exception as e:
         logger.error(f"OCR processing failed for {mkv_path.name}: {e}")
+        return batch_size
+
+
+def process_raw_subtitle_file(
+    subtitle_path,
+    output_dir,
+    api_manager,
+    model_name,
+    audio_model_name,
+    source_lang,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    audio_file=None,
+    extract_audio=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+):
+    """Translate a standalone text subtitle file directly."""
+    source_lang = normalize_track_language(source_lang)
+    print(f"\n{'=' * 60}")
+    print(f"Processing subtitle file: {subtitle_path.name}")
+    print(f"{'=' * 60}\n")
+
+    subtitle_extension = subtitle_path.suffix.lower()
+    expected_output_name = f"{subtitle_path.stem}.es-419{subtitle_extension}"
+    expected_output_path = output_dir / expected_output_name
+    if expected_output_path.exists():
+        logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
+        return batch_size
+
+    logger.info(f"Using source language {source_lang} for raw subtitle translation.")
+
+    if extract_audio:
+        logger.warning(
+            "--extract-audio requires a video input. Ignoring it for raw subtitle files."
+        )
+        extract_audio = False
+
+    translated_subtitle_path, final_batch_size = translate_ass_file(
+        subtitle_path,
+        api_manager,
+        model_name,
+        audio_model_name,
+        None,
+        None,
+        output_dir,
+        subtitle_path.stem,
+        source_lang,
+        subtitle_extension,
+        batch_size,
+        thinking,
+        thinking_budget,
+        keep_original,
+        audio_file,
+        extract_audio,
+        None,
+        free_quota,
+        temperature,
+        top_p,
+        top_k,
+        strip_sdh,
+    )
+
+    if translated_subtitle_path:
+        logger.success(f"Created translated subtitle file: {translated_subtitle_path.name}")
+
+    return final_batch_size
+
+
+def process_raw_pgs_file(
+    subtitle_path,
+    output_dir,
+    api_manager,
+    model_name,
+    audio_model_name,
+    source_lang,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+    ocr_crop=None,
+    ocr_full_frame=False,
+    ocr_request_batch_size=24,
+    ocr_max_items=None,
+    ocr_pgs_size=DEFAULT_RAW_PGS_CANVAS_SIZE,
+):
+    """OCR and translate a standalone raw PGS .sup subtitle file."""
+    source_lang = normalize_track_language(source_lang)
+    print(f"\n{'=' * 60}")
+    print(f"Processing raw PGS OCR: {subtitle_path.name}")
+    print(f"{'=' * 60}\n")
+
+    expected_output_name = f"{subtitle_path.stem}.es-419.srt"
+    expected_output_path = output_dir / expected_output_name
+    if expected_output_path.exists():
+        logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
+        return batch_size
+
+    logger.info(f"Using source language {source_lang} for raw PGS OCR translation.")
+
+    if not is_ollama_provider(api_manager.provider):
+        logger.error("--ocr currently requires an Ollama provider with image support.")
+        return batch_size
+
+    if not check_ffmpeg_tools():
+        logger.error("ffmpeg and ffprobe are required for OCR mode.")
+        return batch_size
+
+    try:
+        width, height = parse_canvas_size(ocr_pgs_size)
+        raw_pgs_mode = f"raw_pgs:{width}x{height}"
+        crop_filter = resolve_ocr_crop_filter(
+            width, height, crop_spec=ocr_crop, full_frame=ocr_full_frame
+        )
+        logger.info(
+            f"Rendering raw PGS subtitles on a {width}x{height} canvas for OCR."
+        )
+
+        cached_samples = _load_ocr_extract_cache(
+            subtitle_path,
+            crop_filter=crop_filter,
+            ocr_mode=raw_pgs_mode,
+            ocr_fps=None,
+            subtitle_stream_index=0,
+        )
+        if cached_samples is not None:
+            logger.info("Reusing cached OCR frame extraction for raw PGS mode.")
+            frame_samples = cached_samples
+            progress_bar(
+                current=len(frame_samples),
+                total=max(len(frame_samples), 1),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Loading cached OCR frames",
+                task_label="OCR",
+                count_text=f"{len(frame_samples)}/{len(frame_samples)}",
+            )
+        else:
+            progress_bar(
+                current=0,
+                total=1,
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Extracting PGS OCR frames",
+                task_label="OCR",
+                count_text="0/1",
+            )
+
+            def log_raw_pgs_progress(done, total):
+                display_total = max(total, done, 1)
+                progress_bar(
+                    current=done,
+                    total=display_total,
+                    model_name=model_name,
+                    is_loading=True,
+                    status_detail="Extracting PGS OCR frames",
+                    task_label="OCR",
+                    count_text=f"{done}/{display_total}",
+                )
+
+            frame_samples = extract_raw_pgs_frames_full_stream(
+                subtitle_path,
+                ocr_pgs_size,
+                crop_filter,
+                progress_callback=log_raw_pgs_progress,
+            )
+            progress_bar(
+                current=len(frame_samples),
+                total=max(len(frame_samples), 1),
+                model_name=model_name,
+                is_loading=True,
+                status_detail="Extracting PGS OCR frames",
+                task_label="OCR",
+                count_text=f"{len(frame_samples)}/{len(frame_samples)}",
+            )
+            _save_ocr_extract_cache(
+                subtitle_path,
+                crop_filter=crop_filter,
+                ocr_mode=raw_pgs_mode,
+                ocr_fps=None,
+                subtitle_stream_index=0,
+                frame_samples=frame_samples,
+            )
+            logger.info("Saved OCR frame extraction to cache for future reuse.")
+
+        ocr_samples = list(frame_samples)
+        logger.log_only(
+            f"Prepared {len(ocr_samples)} raw PGS subtitle bitmap frames for OCR."
+        )
+
+        return finalize_ocr_translation(
+            subtitle_path,
+            output_dir,
+            api_manager,
+            model_name,
+            audio_model_name,
+            source_lang,
+            frame_samples,
+            ocr_samples,
+            batch_size=batch_size,
+            thinking=thinking,
+            thinking_budget=thinking_budget,
+            keep_original=keep_original,
+            free_quota=free_quota,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            strip_sdh=strip_sdh,
+            ocr_request_batch_size=ocr_request_batch_size,
+            ocr_max_items=ocr_max_items,
+        )
+    except Exception as e:
+        logger.error(f"OCR processing failed for {subtitle_path.name}: {e}")
         return batch_size
 
 
@@ -4994,10 +5314,12 @@ def main():
     signal.signal(signal.SIGTERM, handle_process_termination)
 
     parser = argparse.ArgumentParser(
-        description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini or Ollama.\n\n"
+        description="Detects subtitles in .mkv files or translates raw subtitle files to Spanish using Google Gemini or Ollama.\n\n"
         "Usage:\n"
-        "  %(prog)s <file.mkv>              # Process a single file\n"
-        "  %(prog)s <directory>             # Process all .mkv files in directory",
+        "  %(prog)s <file.mkv>              # Process a single MKV\n"
+        "  %(prog)s <file.ass>              # Translate a raw text subtitle file\n"
+        "  %(prog)s --ocr <file.sup>        # OCR a raw PGS subtitle file\n"
+        "  %(prog)s <directory>             # Process supported files in a directory",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -5092,12 +5414,12 @@ def main():
     parser.add_argument(
         "--ocr",
         action="store_true",
-        help="Use burned-in subtitle OCR instead of extracting subtitle tracks from the MKV.",
+        help="Use OCR for burned-in subtitles in MKVs or for raw PGS .sup subtitle files.",
     )
     parser.add_argument(
         "--ocr-lang",
         default="eng",
-        help="Source language code to use for OCR subtitles before translation (default: eng).",
+        help="Source language code to use for OCR/raw subtitle inputs before translation (default: eng).",
     )
     parser.add_argument(
         "--ocr-crop",
@@ -5143,6 +5465,11 @@ def main():
         type=int,
         default=get_default_ocr_extract_workers(),
         help="Number of parallel ffmpeg workers to use for sparse subtitle-frame extraction (default: auto).",
+    )
+    parser.add_argument(
+        "--ocr-pgs-size",
+        default=DEFAULT_RAW_PGS_CANVAS_SIZE,
+        help="Canvas size to use when OCRing a standalone raw PGS .sup file (WIDTHxHEIGHT, default: 1920x1080).",
     )
     parser.add_argument(
         "-a",
@@ -5195,7 +5522,7 @@ def main():
         nargs="?",
         default=None,
         type=Path,
-        help="Path to a single .mkv file or directory containing .mkv files.",
+        help="Path to a supported file (.mkv, .ass, .ssa, .srt, .sup) or a directory containing them.",
     )
 
     args = parser.parse_args()
@@ -5416,6 +5743,12 @@ def main():
         logger.error("--ocr currently requires an Ollama provider with image support.")
         sys.exit(1)
 
+    try:
+        parse_canvas_size(args.ocr_pgs_size)
+    except ValueError as e:
+        logger.error(f"Invalid --ocr-pgs-size: {e}")
+        sys.exit(1)
+
     # Handle --list-models before checking other args
     if args.list_models:
         try:
@@ -5433,11 +5766,8 @@ def main():
 
     # Pre-execution checks
     if not args.input_path:
-        logger.error("You must provide a path to an .mkv file or directory.")
+        logger.error("You must provide a supported file path or directory.")
         parser.print_help()
-        sys.exit(1)
-
-    if not check_mkvtoolnix():
         sys.exit(1)
 
     args.output_dir.mkdir(exist_ok=True)
@@ -5447,23 +5777,26 @@ def main():
 
     # File processing loop
     try:
-        files_to_process = resolve_mkv_input_files(args.input_path)
+        files_to_process = resolve_input_files(args.input_path)
     except ValueError as e:
         logger.error(str(e))
         sys.exit(1)
 
+    if any(is_mkv_path(file_path) for file_path in files_to_process) and not check_mkvtoolnix():
+        sys.exit(1)
+
     if not files_to_process:
-        logger.warning("No .mkv files found to process.")
+        logger.warning("No supported input files found to process.")
         return
 
     remembered_lang = None
     remembered_secondary_lang = None
     remembered_batch_size = args.batch_size
     for file_path in files_to_process:
-        if file_path.suffix == ".mkv":
-            # Set free_quota based on paid_quota flag (inverted logic)
-            free_quota = not args.paid_quota
+        final_batch_size = remembered_batch_size
+        free_quota = not args.paid_quota
 
+        if is_mkv_path(file_path):
             if args.ocr:
                 final_batch_size = process_mkv_ocr_file(
                     file_path,
@@ -5511,17 +5844,71 @@ def main():
                     args.top_k,
                     args.strip_sdh,
                 )
-                # Remember language selection for subsequent files
                 if chosen_lang:
                     remembered_lang = chosen_lang
                 remembered_secondary_lang = chosen_secondary_lang
-
-            # Remember batch size adjustment for subsequent files
-            if final_batch_size and final_batch_size != remembered_batch_size:
-                logger.info(
-                    f"Batch size adjusted to {final_batch_size} - will use for remaining files"
+        elif is_raw_text_subtitle_path(file_path):
+            if args.ocr:
+                logger.warning(
+                    f"Skipping {file_path.name}: --ocr is only needed for MKVs or raw .sup PGS files."
                 )
-                remembered_batch_size = final_batch_size
+                continue
+
+            final_batch_size = process_raw_subtitle_file(
+                file_path,
+                args.output_dir,
+                api_manager,
+                args.model,
+                args.audio_model,
+                args.ocr_lang,
+                remembered_batch_size,
+                args.thinking,
+                args.thinking_budget,
+                args.keep_original,
+                args.audio_file,
+                args.extract_audio,
+                free_quota,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.strip_sdh,
+            )
+        elif is_raw_ocr_subtitle_path(file_path):
+            if not args.ocr:
+                logger.warning(
+                    f"Skipping {file_path.name}: raw .sup PGS inputs require --ocr."
+                )
+                continue
+
+            final_batch_size = process_raw_pgs_file(
+                file_path,
+                args.output_dir,
+                api_manager,
+                args.model,
+                args.audio_model,
+                args.ocr_lang,
+                remembered_batch_size,
+                args.thinking,
+                args.thinking_budget,
+                args.keep_original,
+                free_quota,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.strip_sdh,
+                args.ocr_crop,
+                args.ocr_full_frame,
+                args.ocr_request_batch_size,
+                args.ocr_max_items,
+                args.ocr_pgs_size,
+            )
+
+        # Remember batch size adjustment for subsequent files
+        if final_batch_size and final_batch_size != remembered_batch_size:
+            logger.info(
+                f"Batch size adjusted to {final_batch_size} - will use for remaining files"
+            )
+            remembered_batch_size = final_batch_size
 
     logger.success("--- All files processed. ---")
 
