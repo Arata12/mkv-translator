@@ -1,13 +1,14 @@
 # MKV Subtitle Translator
 
-Translate MKV subtitle tracks to Latin American Spanish and mux them back into the video.
+Translate MKV subtitle tracks or standalone subtitle files to Latin American Spanish.
 
 ## What It Does
 
 - Translates MKV subtitles to Latin American Spanish
-- Works with text subtitle tracks (`ASS`, `SSA`, `SRT`), hardcoded subtitles, and image subtitle tracks like `PGS`
+- Translates standalone text subtitles (`.ass`, `.ssa`, `.srt`)
+- Works with MKV subtitle tracks, standalone subtitle files, and OCR for hardcoded or raw `PGS` inputs
 - Supports Gemini and Ollama
-- Can mux the translated subtitles back into the video
+- Can mux translated subtitles back into MKVs
 
 ## Defaults
 
@@ -22,9 +23,9 @@ If the main translation model does not support audio input, Gemini audio fallbac
 
 ### System
 
-- `mkvmerge`
-- `mkvextract`
+- `mkvmerge` and `mkvextract` for MKV workflows
 - `ffmpeg` and `ffprobe` if you want audio-aware translation
+- `ffmpeg` and `ffprobe` for OCR mode, including raw `.sup` PGS input
 
 Install examples:
 
@@ -78,10 +79,16 @@ Translate one file:
 python3 translator.py --api-key YOUR_KEY video.mkv
 ```
 
-Translate every MKV in a directory:
+Translate every supported file in a directory:
 
 ```bash
 python3 translator.py --api-key YOUR_KEY /path/to/videos
+```
+
+Translate a standalone subtitle file directly:
+
+```bash
+python3 translator.py --api-key YOUR_KEY episode01.ass
 ```
 
 ## Common Examples
@@ -116,6 +123,24 @@ OCR hardcoded subtitles with Ollama Gemma:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
 ```
 
+OCR a standalone raw PGS `.sup` file:
+
+```bash
+python3 translator.py --provider ollama-local --model gemma3:27b --ocr --ocr-lang eng subtitles.sup
+```
+
+OCR a raw PGS `.sup` file with an explicit canvas size:
+
+```bash
+python3 translator.py --ocr --ocr-lang eng --ocr-pgs-size 1920x1080 subtitles.sup
+```
+
+Limit OCR to the first 20 subtitle images for testing:
+
+```bash
+python3 translator.py --ocr --ocr-lang eng --ocr-max-items 20 video.mkv
+```
+
 Run diagnostics:
 
 ```bash
@@ -142,7 +167,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 
 ## All Flags
 
-- `INPUT_PATH` - single `.mkv` file or a directory containing `.mkv` files
+- `INPUT_PATH` - single supported file (`.mkv`, `.ass`, `.ssa`, `.srt`, `.sup`) or a directory containing them
 - `--provider {gemini,ollama-local,ollama-cloud}` - select the LLM provider
 - `--base-url URL` - override the API base URL
 - `--api-key KEY` - primary API key for the selected provider
@@ -161,17 +186,19 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--no-colors` - disable colored terminal output
 - `--keep-original` - keep original text as hidden ASS comments during translation
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
-- `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
-- `--ocr-lang CODE` - source language code for OCR subtitles before translation
+- `--ocr` - use OCR for burned-in subtitles in MKVs or raw `.sup` PGS files
+- `--ocr-lang CODE` - source language code for OCR or raw subtitle inputs before translation
 - `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
 - `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
 - `--ocr-fps FLOAT` - frame sampling rate before OCR similarity filtering
 - `--ocr-frame-diff FLOAT` - minimum grayscale change before re-running OCR on a sampled frame
 - `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
 - `--ocr-request-batch-size N` - number of images per OCR model request
+- `--ocr-max-items N` - limit OCR to the first N extracted subtitle samples for testing
 - `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
+- `--ocr-pgs-size WIDTHxHEIGHT` - canvas size used when rendering standalone raw `.sup` PGS files for OCR
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
-- `--extract-audio` - extract audio from the MKV for gender-aware translation
+- `--extract-audio` - extract audio from an MKV for gender-aware translation
 - `--strip-sdh` - remove SDH elements like speaker names and sound-effect captions
 - `--paid-quota` - remove artificial free-tier delays
 - `--temperature FLOAT` - sampling temperature
@@ -184,6 +211,8 @@ By default, files are written to `translated_subs/`:
 
 - `video.translated.mkv`
 - `video.es-419.ass` or `.srt` or `.ssa`
+- `subtitles.es-419.ass` or `.srt` or `.ssa` for standalone subtitle inputs
+- `subtitles.es-419.srt` for standalone raw `.sup` OCR inputs
 - `video.translation.log` if `--progress-log` is enabled
 - `video.thoughts.log` if `--thoughts-log` is enabled
 
@@ -199,7 +228,6 @@ By default, files are written to `translated_subs/`:
 - ASS formatting is preserved mechanically, not just by prompt instructions
 - Audio-aware translation is mainly useful for gendered languages like Spanish
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
-- OCR mode currently uses Ollama vision models and is best treated as experimental
-- OCR mode samples subtitle events directly for image subtitle tracks like PGS instead of scanning the whole video
-- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
+- OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
+- Raw `.sup` OCR may need `--ocr-pgs-size WIDTHxHEIGHT` if the default canvas size is wrong
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages

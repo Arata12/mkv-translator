@@ -46,6 +46,177 @@ class OCRFrameSample:
         return self.image_hash
 
 
+# Cache version for persistent OCR extraction caching
+OCR_EXTRACT_CACHE_VERSION = 1
+
+
+def get_ocr_extract_cache_dir(mkv_path: Path) -> Path:
+    """Return the directory path for OCR extraction cache."""
+    return Path("tmp") / f"{mkv_path.stem}.ocr-extract"
+
+
+def parse_canvas_size(canvas_size: str):
+    """Parse a WIDTHxHEIGHT canvas size string."""
+    normalized = (canvas_size or "").strip().lower()
+    if "x" not in normalized:
+        raise ValueError("canvas size must use WIDTHxHEIGHT format")
+
+    width_str, height_str = normalized.split("x", 1)
+    try:
+        width = int(width_str)
+        height = int(height_str)
+    except ValueError as exc:
+        raise ValueError("canvas size must use WIDTHxHEIGHT format") from exc
+
+    if width <= 0 or height <= 0:
+        raise ValueError("canvas size values must be positive")
+
+    return width, height
+
+
+def _save_ocr_extract_cache(
+    mkv_path: Path,
+    crop_filter: str,
+    ocr_mode: str,
+    ocr_fps: float | None,
+    subtitle_stream_index: int | None,
+    frame_samples: list[OCRFrameSample],
+):
+    """Save OCR extraction cache to disk for later reuse."""
+    cache_dir = get_ocr_extract_cache_dir(mkv_path)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    images_dir = cache_dir / "images"
+    images_dir.mkdir(exist_ok=True)
+
+    signatures_dir = cache_dir / "signatures"
+    signatures_dir.mkdir(exist_ok=True)
+
+    frame_metadata = []
+    for sample in frame_samples:
+        image_hash = sample.get_image_hash()
+        suffix = ".png"
+        if sample.image_bytes:
+            if sample.image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                suffix = ".png"
+            elif sample.image_bytes.startswith(b"\xff\xd8\xff"):
+                suffix = ".jpg"
+        else:
+            suffix = Path(sample.image_path or "frame.png").suffix or ".png"
+
+        image_filename = f"{sample.index:06d}_{image_hash[:12]}{suffix}"
+        image_path = images_dir / image_filename
+
+        if sample.image_bytes and not image_path.exists():
+            image_path.write_bytes(sample.image_bytes)
+        elif sample.image_path and sample.image_path.exists() and not image_path.exists():
+            shutil.copy2(sample.image_path, image_path)
+
+        signature_filename = None
+        signature_path_local = None
+        if sample.signature_path and sample.signature_path.exists():
+            signature_filename = f"{sample.index:06d}_{image_hash[:12]}.pgm"
+            signature_path_local = signatures_dir / signature_filename
+            if not signature_path_local.exists():
+                shutil.copy2(sample.signature_path, signature_path_local)
+
+        frame_metadata.append(
+            {
+                "index": sample.index,
+                "timestamp_s": sample.timestamp_s,
+                "image_hash": image_hash,
+                "image_filename": image_filename,
+                "signature_filename": signature_filename,
+            }
+        )
+
+    metadata = {
+        "version": OCR_EXTRACT_CACHE_VERSION,
+        "input_file": str(mkv_path),
+        "crop_filter": crop_filter,
+        "ocr_mode": ocr_mode,
+        "ocr_fps": ocr_fps,
+        "subtitle_stream_index": subtitle_stream_index,
+        "frame_count": len(frame_samples),
+        "frames": frame_metadata,
+    }
+
+    metadata_file = cache_dir / "metadata.json"
+    with open(metadata_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def _load_ocr_extract_cache(
+    mkv_path: Path,
+    crop_filter: str,
+    ocr_mode: str,
+    ocr_fps: float | None,
+    subtitle_stream_index: int | None,
+) -> list[OCRFrameSample] | None:
+    """Load OCR extraction cache from disk if compatible. Returns None if not compatible."""
+    cache_dir = get_ocr_extract_cache_dir(mkv_path)
+    metadata_file = cache_dir / "metadata.json"
+
+    if not metadata_file.exists():
+        return None
+
+    try:
+        with open(metadata_file, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+    if metadata.get("version") != OCR_EXTRACT_CACHE_VERSION:
+        return None
+    if metadata.get("input_file") != str(mkv_path):
+        return None
+    if metadata.get("crop_filter") != crop_filter:
+        return None
+    if metadata.get("ocr_mode") != ocr_mode:
+        return None
+    if metadata.get("ocr_fps") != ocr_fps:
+        return None
+    if metadata.get("subtitle_stream_index") != subtitle_stream_index:
+        return None
+
+    images_dir = cache_dir / "images"
+    signatures_dir = cache_dir / "signatures"
+
+    if not images_dir.exists():
+        return None
+
+    frame_samples = []
+    for frame_info in metadata.get("frames", []):
+        image_filename = frame_info.get("image_filename")
+        if not image_filename:
+            return None
+
+        image_path = images_dir / image_filename
+        if not image_path.exists():
+            return None
+
+        signature_path = None
+        signature_filename = frame_info.get("signature_filename")
+        if signature_filename and signatures_dir.exists():
+            signature_path = signatures_dir / signature_filename
+            if not signature_path.exists():
+                signature_path = None
+
+        frame_samples.append(
+            OCRFrameSample(
+                index=frame_info.get("index", 0),
+                timestamp_s=frame_info.get("timestamp_s", 0.0),
+                image_path=image_path,
+                signature_path=signature_path,
+            )
+        )
+
+    if not frame_samples:
+        return None
+
+    return frame_samples
+
+
 def get_subtitle_packet_timestamps(video_path: Path, subtitle_stream_index):
     """Read raw subtitle packet timestamps for one subtitle stream."""
     command = [
@@ -208,12 +379,75 @@ def _count_matching_files(directory: Path, suffix: str):
     return sum(1 for entry in directory.iterdir() if entry.is_file() and entry.name.endswith(suffix))
 
 
+def _run_ffmpeg_sequence_with_progress(
+    command,
+    output_dir: Path,
+    suffix: str,
+    progress_callback=None,
+    progress_offset=0,
+    progress_total=None,
+):
+    """Run an ffmpeg image-sequence job while reporting extraction progress."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        start_new_session=True,
+    )
+    track_process(process)
+    last_reported = -1
+    stop_event = threading.Event()
+
+    def report_progress(frame_count):
+        nonlocal last_reported
+        if not progress_callback or frame_count == last_reported:
+            return
+        last_reported = frame_count
+        total = max(progress_total or 0, progress_offset + frame_count, 1)
+        progress_callback(progress_offset + frame_count, total)
+
+    def poll_output_files():
+        while not stop_event.wait(0.1):
+            report_progress(_count_matching_files(output_dir, suffix))
+
+    poll_thread = threading.Thread(target=poll_output_files, daemon=True)
+    poll_thread.start()
+
+    try:
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if line.startswith("frame="):
+                try:
+                    report_progress(int(line.split("=", 1)[1]))
+                except ValueError:
+                    continue
+        process.wait()
+    finally:
+        stop_event.set()
+        poll_thread.join(timeout=1)
+        untrack_process(process)
+
+    if process.returncode != 0:
+        raise subprocess.CalledProcessError(process.returncode, command)
+
+    final_count = _count_matching_files(output_dir, suffix)
+    report_progress(final_count)
+    return final_count
+
+
 def extract_ocr_frames(
     video_path: Path,
     working_dir: Path,
     fps: float,
     crop_filter: str,
     subtitle_stream_index=None,
+    expected_total=None,
+    progress_callback=None,
 ):
     """Extract OCR frames plus tiny grayscale signatures for dedupe."""
     if fps <= 0:
@@ -235,6 +469,9 @@ def extract_ocr_frames(
             "ffmpeg",
             "-v",
             "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-y",
             "-i",
             str(video_path),
@@ -250,6 +487,9 @@ def extract_ocr_frames(
             "ffmpeg",
             "-v",
             "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-y",
             "-i",
             str(video_path),
@@ -267,6 +507,9 @@ def extract_ocr_frames(
             "ffmpeg",
             "-v",
             "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-y",
             "-i",
             str(video_path),
@@ -284,6 +527,9 @@ def extract_ocr_frames(
             "ffmpeg",
             "-v",
             "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-y",
             "-i",
             str(video_path),
@@ -296,15 +542,23 @@ def extract_ocr_frames(
             str(signature_pattern),
         ]
 
-    run_tracked_subprocess(
-        image_command, check=True, capture_output=True, text=True, encoding="utf-8"
+    combined_total = expected_total * 2 if expected_total else None
+    image_count = _run_ffmpeg_sequence_with_progress(
+        image_command,
+        image_dir,
+        ".jpg",
+        progress_callback=progress_callback,
+        progress_offset=0,
+        progress_total=combined_total,
     )
-    run_tracked_subprocess(
+    signature_offset = expected_total or image_count
+    _run_ffmpeg_sequence_with_progress(
         signature_command,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
+        signature_dir,
+        ".pgm",
+        progress_callback=progress_callback,
+        progress_offset=signature_offset,
+        progress_total=combined_total,
     )
 
     image_files = sorted(image_dir.glob("frame_*.jpg"))
@@ -508,6 +762,75 @@ def extract_subtitle_bitmap_frames_full_stream(
     return samples
 
 
+def extract_raw_pgs_frames_full_stream(
+    subtitle_path: Path,
+    canvas_size: str,
+    crop_filter: str,
+    progress_callback=None,
+):
+    """Render a standalone PGS .sup subtitle file onto a synthetic canvas."""
+    width, height = parse_canvas_size(canvas_size)
+    timestamps = get_subtitle_packet_timestamps(subtitle_path, 0)
+    if not timestamps:
+        raise RuntimeError("No PGS subtitle timestamps were found in the .sup file")
+
+    image_dir = get_ram_temp_dir("pgs_ocr_")
+    image_pattern = image_dir / "frame_%06d.png"
+    canvas_input = f"color=size={width}x{height}:rate=24000/1001:color=black@0.0,format=rgba"
+    filter_complex = f"[0:v][1:s:0]overlay,format=rgba,{crop_filter}[vout]"
+    command = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-nostats",
+        "-progress",
+        "pipe:1",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        canvas_input,
+        "-i",
+        str(subtitle_path),
+        "-filter_complex",
+        filter_complex,
+        "-map",
+        "[vout]",
+        "-an",
+        "-vsync",
+        "vfr",
+        str(image_pattern),
+    ]
+
+    _run_ffmpeg_sequence_with_progress(
+        command,
+        image_dir,
+        ".png",
+        progress_callback=progress_callback,
+        progress_total=len(timestamps),
+    )
+
+    image_files = sorted(image_dir.glob("frame_*.png"))
+    if not image_files:
+        raise RuntimeError("No subtitle bitmap frames were extracted from the .sup file")
+
+    count = min(len(image_files), len(timestamps))
+    samples = []
+    for idx in range(count):
+        image_bytes = image_files[idx].read_bytes()
+        samples.append(
+            OCRFrameSample(
+                index=idx,
+                timestamp_s=timestamps[idx],
+                image_bytes=image_bytes,
+                image_hash=md5(image_bytes).hexdigest(),
+            )
+        )
+
+    shutil.rmtree(image_dir, ignore_errors=True)
+    return samples
+
+
 def count_subtitle_bitmap_frames_full_stream(
     video_path: Path,
     crop_filter: str,
@@ -697,6 +1020,36 @@ def choose_representative_ocr_text(texts):
     return max(texts, key=text_score)
 
 
+def prune_and_merge_adjacent_identical_subs(subs, max_gap_s=1.0):
+    """Drop empty subtitle events and merge adjacent identical ones with small gaps."""
+    if not subs:
+        return subs
+
+    max_gap_ms = int(max_gap_s * 1000)
+    merged_events = []
+
+    for event in subs:
+        normalized_text = normalize_ocr_text(event.text)
+        if not normalized_text:
+            continue
+
+        event.text = normalized_text
+        if not merged_events:
+            merged_events.append(event)
+            continue
+
+        previous_event = merged_events[-1]
+        gap_ms = max(0, event.start - previous_event.end)
+        if normalize_ocr_text(previous_event.text) == normalized_text and gap_ms <= max_gap_ms:
+            previous_event.end = max(previous_event.end, event.end)
+            continue
+
+        merged_events.append(event)
+
+    subs.events = merged_events
+    return subs
+
+
 def build_srt_from_ocr_results(
     samples_with_text,
     output_path: Path,
@@ -781,6 +1134,8 @@ def build_srt_from_ocr_results(
 
     if not subs:
         raise RuntimeError("OCR did not produce any readable subtitle lines")
+
+    prune_and_merge_adjacent_identical_subs(subs, max_gap_s=1.0)
 
     subs.save(str(output_path))
     return output_path
