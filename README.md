@@ -5,9 +5,7 @@ Translate MKV subtitle tracks or standalone subtitle files to Latin American Spa
 ## What It Does
 
 - Translates MKV subtitles to Latin American Spanish
-- Translates standalone text subtitles (`.ass`, `.ssa`, `.srt`)
-- OCRs MKV hardcoded/image subtitle inputs
-- Supports text subtitle tracks (`ASS`, `SSA`, `SRT`) and OCR for hardcoded/image subtitle tracks like `PGS`
+- Works with MKV subtitle tracks, standalone text subtitles (`ASS`, `SSA`, `SRT`), and OCR for hardcoded or image subtitle tracks like `PGS`
 - Supports Gemini and Ollama
 - Can mux translated subtitles back into MKVs
 
@@ -25,8 +23,7 @@ If the main translation model does not support audio input, Gemini audio fallbac
 ### System
 
 - `mkvmerge` and `mkvextract` for MKV workflows
-- `ffmpeg` and `ffprobe` if you want audio-aware translation
-- `ffmpeg` and `ffprobe` for OCR mode
+- `ffmpeg` and `ffprobe` for audio-aware translation or OCR mode
 
 Install examples:
 
@@ -124,12 +121,6 @@ OCR hardcoded subtitles with Ollama Gemma:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
 ```
 
-Limit OCR to the first 20 subtitle images for testing:
-
-```bash
-python3 translator.py --ocr --ocr-lang eng --ocr-max-items 20 video.mkv
-```
-
 Run diagnostics:
 
 ```bash
@@ -182,6 +173,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--ocr-frame-diff FLOAT` - minimum grayscale change before re-running OCR on a sampled frame
 - `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
 - `--ocr-request-batch-size N` - number of images per OCR model request
+- `--ocr-max-items N` - limit OCR to the first N subtitle images for testing
 - `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
@@ -216,17 +208,7 @@ By default, files are written to `translated_subs/`:
 - Thinking is enabled by default for supported models; use `--no-thinking` to disable it
 - OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
 - OCR mode currently uses Ollama vision models and is best treated as experimental
-- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
-- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
-- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
-- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
-- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
-- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
-- OCR mode currently uses Ollama vision models and is best treated as experimental
-- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
-- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
-- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
-- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
-- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
-- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
+- OCR frame extraction and OCR review sessions are cached under `tmp/` for reuse
+- The OCR review web UI pauses translation so you can correct OCR text before translation continues
+- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the OCR model requests
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages
