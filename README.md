@@ -1,13 +1,15 @@
 # MKV Subtitle Translator
 
-Translate MKV subtitle tracks to Latin American Spanish and mux them back into the video.
+Translate MKV subtitle tracks or standalone subtitle files to Latin American Spanish.
 
 ## What It Does
 
 - Translates MKV subtitles to Latin American Spanish
-- Works with text subtitle tracks (`ASS`, `SSA`, `SRT`), hardcoded subtitles, and image subtitle tracks like `PGS`
+- Translates standalone text subtitles (`.ass`, `.ssa`, `.srt`)
+- OCRs MKV hardcoded/image subtitle inputs
+- Supports text subtitle tracks (`ASS`, `SSA`, `SRT`) and OCR for hardcoded/image subtitle tracks like `PGS`
 - Supports Gemini and Ollama
-- Can mux the translated subtitles back into the video
+- Can mux translated subtitles back into MKVs
 
 ## Defaults
 
@@ -22,9 +24,9 @@ If the main translation model does not support audio input, Gemini audio fallbac
 
 ### System
 
-- `mkvmerge`
-- `mkvextract`
+- `mkvmerge` and `mkvextract` for MKV workflows
 - `ffmpeg` and `ffprobe` if you want audio-aware translation
+- `ffmpeg` and `ffprobe` for OCR mode
 
 Install examples:
 
@@ -78,10 +80,16 @@ Translate one file:
 python3 translator.py --api-key YOUR_KEY video.mkv
 ```
 
-Translate every MKV in a directory:
+Translate every supported file in a directory:
 
 ```bash
 python3 translator.py --api-key YOUR_KEY /path/to/videos
+```
+
+Translate a standalone subtitle file directly:
+
+```bash
+python3 translator.py --api-key YOUR_KEY episode01.ass
 ```
 
 ## Common Examples
@@ -116,6 +124,12 @@ OCR hardcoded subtitles with Ollama Gemma:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
 ```
 
+Limit OCR to the first 20 subtitle images for testing:
+
+```bash
+python3 translator.py --ocr --ocr-lang eng --ocr-max-items 20 video.mkv
+```
+
 Run diagnostics:
 
 ```bash
@@ -142,7 +156,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 
 ## All Flags
 
-- `INPUT_PATH` - single `.mkv` file or a directory containing `.mkv` files
+- `INPUT_PATH` - single supported file (`.mkv`, `.ass`, `.ssa`, `.srt`) or a directory containing them
 - `--provider {gemini,ollama-local,ollama-cloud}` - select the LLM provider
 - `--base-url URL` - override the API base URL
 - `--api-key KEY` - primary API key for the selected provider
@@ -160,7 +174,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--no-colors` - disable colored terminal output
 - `--keep-original` - keep original text as hidden ASS comments during translation
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
-- `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
+- `--ocr` - extract burned-in subtitles with OCR for MKVs
 - `--ocr-lang CODE` - source language code for OCR subtitles before translation
 - `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
 - `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
@@ -183,6 +197,7 @@ By default, files are written to `translated_subs/`:
 
 - `video.translated.mkv`
 - `video.es-419.ass` or `.srt` or `.ssa`
+- `subtitles.es-419.ass` or `.srt` or `.ssa` for standalone subtitle inputs
 - `video.translation.log` if `--progress-log` is enabled
 - `video.thoughts.log` if `--thoughts-log` is enabled
 
@@ -200,4 +215,18 @@ By default, files are written to `translated_subs/`:
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
 - Thinking is enabled by default for supported models; use `--no-thinking` to disable it
 - OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
+- OCR mode currently uses Ollama vision models and is best treated as experimental
+- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
+- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
+- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
+- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
+- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
+- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
+- OCR mode currently uses Ollama vision models and is best treated as experimental
+- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
+- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
+- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
+- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
+- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
+- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages
