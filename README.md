@@ -6,7 +6,7 @@ Translate MKV subtitle tracks or standalone subtitle files to Latin American Spa
 
 - Translates MKV subtitles to Latin American Spanish
 - Translates standalone text subtitles (`.ass`, `.ssa`, `.srt`)
-- OCRs MKV hardcoded/image subtitle inputs and standalone raw `PGS` `.sup` files
+- Works with MKV subtitle tracks, standalone subtitle files, and OCR for hardcoded or raw `PGS` inputs
 - Supports Gemini and Ollama
 - Can mux translated subtitles back into MKVs
 
@@ -186,7 +186,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--no-colors` - disable colored terminal output
 - `--keep-original` - keep original text as hidden ASS comments during translation
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
-- `--ocr` - extract burned-in subtitles with OCR for MKVs or OCR standalone raw `.sup` PGS files
+- `--ocr` - use OCR for burned-in subtitles in MKVs or raw `.sup` PGS files
 - `--ocr-lang CODE` - source language code for OCR or raw subtitle inputs before translation
 - `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
 - `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
@@ -228,12 +228,6 @@ By default, files are written to `translated_subs/`:
 - ASS formatting is preserved mechanically, not just by prompt instructions
 - Audio-aware translation is mainly useful for gendered languages like Spanish
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
-- OCR mode currently uses Ollama vision models and is best treated as experimental
-- Raw `.sup` support reuses `--ocr`; if the canvas size is wrong, pass `--ocr-pgs-size WIDTHxHEIGHT`
-- OCR mode now processes every extracted OCR event/sample instead of deduplicating them before OCR
-- OCR mode caches extracted OCR frames in `tmp/<name>.ocr-extract/` and review sessions in `tmp/<name>.ocr-review/` so reruns can resume without re-extracting everything
-- OCR mode pauses before translation with a local review web UI so you can correct OCR text manually and resume later from saved progress
-- The OCR review web UI groups contiguous identical OCR lines, hides blank OCR groups, and shows start/end ranges for each grouped item
-- Final OCR SRT output removes blank entries and merges adjacent subtitle lines when the text matches exactly and the gap is 1 second or less
-- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the number of vision-model OCR requests
+- OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
+- Raw `.sup` OCR may need `--ocr-pgs-size WIDTHxHEIGHT` if the default canvas size is wrong
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages
