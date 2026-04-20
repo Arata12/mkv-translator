@@ -163,8 +163,6 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
 - `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
 - `--ocr-lang CODE` - source language code for OCR subtitles before translation
-- `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
-- `--ocr-lang CODE` - source language code for OCR subtitles before translation
 - `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
 - `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
 - `--ocr-fps FLOAT` - frame sampling rate before OCR similarity filtering
