@@ -2192,6 +2192,24 @@ def has_strong_source_language_signal(text, source_lang=None):
     return len(stripped.split()) >= 4
 
 
+def find_source_script_leaks(translated_batch, source_lang=None):
+    """Detect translated lines that still contain source-script characters."""
+    if source_lang not in {"ja", "jpn", "japanese"}:
+        return []
+
+    leaked = []
+    japanese_pattern = r"[ぁ-ゟ゠-ヿㇰ-ㇿ一-鿿々〆ヵヶ]"
+
+    for translated_item in translated_batch:
+        item_index = str(translated_item.get("index", "")) or "?"
+        translated_text = translated_item.get("content", "")
+        normalized_text = restore_ass_directives(remove_formatting(translated_text))
+        if re.search(japanese_pattern, normalized_text):
+            leaked.append(item_index)
+
+    return leaked
+
+
 def find_suspicious_unchanged_translations(batch, translated_batch, source_lang=None):
     """Detect lines that were returned essentially unchanged from the source."""
     suspicious = []
@@ -2732,7 +2750,26 @@ def process_batch_streaming_ollama(
         suspicious_indices = find_suspicious_unchanged_translations(
             batch, translated_batch, source_lang=source_lang
         )
+        script_leak_indices = find_source_script_leaks(
+            translated_batch, source_lang=source_lang
+        )
         leak_threshold = max(3, (len(batch) * 8 + 99) // 100)
+        if script_leak_indices:
+            if source_leak_retry_count < max_source_leak_retries:
+                source_leak_retry_count += 1
+                corrective_message = (
+                    f"Your previous answer left Japanese characters in lines {', '.join(map(str, script_leak_indices[:8]))}. "
+                    "Translate those lines fully into Latin American Spanish. Do not leave any Japanese characters in the output. "
+                    "If a name must stay recognizable, romanize it into Latin script instead of keeping Japanese glyphs."
+                )
+                clear_progress()
+                warning_with_progress(
+                    "Detected untranslated Japanese characters in the batch. Retrying..."
+                )
+                continue
+            raise ValueError(
+                f"Persistent untranslated Japanese characters detected in batch lines: {', '.join(map(str, script_leak_indices[:8]))}"
+            )
         if len(suspicious_indices) >= leak_threshold:
             if source_leak_retry_count < max_source_leak_retries:
                 source_leak_retry_count += 1
@@ -3081,7 +3118,26 @@ def process_batch_streaming(
             suspicious_indices = find_suspicious_unchanged_translations(
                 batch, translated_batch, source_lang=source_lang
             )
+            script_leak_indices = find_source_script_leaks(
+                translated_batch, source_lang=source_lang
+            )
             leak_threshold = max(3, (len(batch) * 8 + 99) // 100)
+            if script_leak_indices:
+                if source_leak_retry_count < max_source_leak_retries:
+                    source_leak_retry_count += 1
+                    corrective_message = (
+                        f"Your previous answer left Japanese characters in lines {', '.join(map(str, script_leak_indices[:8]))}. "
+                        "Translate those lines fully into Latin American Spanish. Do not leave any Japanese characters in the output. "
+                        "If a name must stay recognizable, romanize it into Latin script instead of keeping Japanese glyphs."
+                    )
+                    clear_progress()
+                    warning_with_progress(
+                        "Detected untranslated Japanese characters in the batch. Retrying..."
+                    )
+                    continue
+                raise ValueError(
+                    f"Persistent untranslated Japanese characters detected in batch lines: {', '.join(map(str, script_leak_indices[:8]))}"
+                )
             if len(suspicious_indices) >= leak_threshold:
                 if source_leak_retry_count < max_source_leak_retries:
                     source_leak_retry_count += 1
