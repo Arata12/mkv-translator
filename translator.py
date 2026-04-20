@@ -176,6 +176,39 @@ def extract_ollama_chunk_text(chunk):
     return response_text or ""
 
 
+def extract_ollama_chunk_thinking(chunk):
+    """Extract Ollama thinking trace content when available."""
+    if isinstance(chunk, dict):
+        return (chunk.get("message") or {}).get("thinking", "") or chunk.get(
+            "thinking", ""
+        )
+
+    message = getattr(chunk, "message", None)
+    if message is not None:
+        if isinstance(message, dict):
+            return message.get("thinking", "") or ""
+        return getattr(message, "thinking", "") or ""
+
+    return getattr(chunk, "thinking", "") or ""
+
+
+def get_ollama_think_value(model_name, thinking, thinking_budget=2048):
+    """Map generic thinking flags to the Ollama think parameter."""
+    if not thinking:
+        if "gpt-oss" in model_name.lower():
+            return "low"
+        return False
+
+    if "gpt-oss" in model_name.lower():
+        if thinking_budget >= 8192:
+            return "high"
+        if thinking_budget >= 2048:
+            return "medium"
+        return "low"
+
+    return True
+
+
 def load_dotenv_file(env_path):
     """Load simple KEY=VALUE pairs from a .env file without overriding real env vars."""
     loaded = False
@@ -1830,6 +1863,7 @@ def get_translation_config(
     return {
         "provider": provider,
         "system_instruction": system_instruction,
+        "think": get_ollama_think_value(model_name, thinking, thinking_budget),
         "format": {
             "type": "array",
             "items": {
@@ -2640,9 +2674,11 @@ def process_batch_streaming_ollama(
     corrective_message = None
     source_leak_retry_count = 0
     max_source_leak_retries = 2
+    final_thoughts_text = ""
 
     while done == False:
         response_text = ""
+        thoughts_text = ""
         chunk_count = 0
 
         messages = [{"role": "system", "content": config["system_instruction"]}]
@@ -2658,6 +2694,7 @@ def process_batch_streaming_ollama(
             "messages": messages,
             "stream": True,
             "format": config.get("format", "json"),
+            "think": config.get("think", False),
         }
         if config.get("options"):
             chat_kwargs["options"] = config["options"]
@@ -2665,6 +2702,17 @@ def process_batch_streaming_ollama(
         response = client.chat(**chat_kwargs)
 
         for chunk in response:
+            thinking_text = extract_ollama_chunk_thinking(chunk)
+            if thinking_text:
+                thoughts_text += thinking_text
+                progress_bar(
+                    current=current_line,
+                    total=total_lines,
+                    model_name=model_name,
+                    chunk_size=min(chunk_count, max(0, total_lines - current_line)),
+                    is_thinking=True,
+                )
+
             part_text = extract_ollama_chunk_text(chunk)
             if not part_text:
                 continue
@@ -2816,7 +2864,11 @@ def process_batch_streaming_ollama(
                             translated_subtitle[duplicate_idx] = content
 
         _last_chunk_size = len(translated_batch)
+        final_thoughts_text = thoughts_text
         done = True
+
+        if final_thoughts_text:
+            logger.save_thoughts(final_thoughts_text, batch_number)
 
         return [
             {"role": "user", "content": json.dumps(batch, ensure_ascii=False)},
@@ -4276,6 +4328,7 @@ def run_ocr_batch_ollama(
             messages=messages,
             stream=False,
             format=response_schema,
+            think=False,
             options=options,
         )
 
@@ -4344,6 +4397,7 @@ def run_ocr_single_image_strict(
             messages=messages,
             stream=False,
             format=response_schema,
+            think=False,
             options=options,
         )
 
@@ -5108,12 +5162,6 @@ def main():
         help="Number of lines to translate per batch (default: 300).",
     )
     parser.add_argument(
-        "--thinking",
-        action="store_true",
-        default=True,
-        help="Enable thinking mode for better translations (default: enabled for Gemini 2.5+).",
-    )
-    parser.add_argument(
         "--no-thinking", action="store_true", help="Disable thinking mode."
     )
     parser.add_argument(
@@ -5254,6 +5302,7 @@ def main():
         help="Path to a single .mkv file or directory containing .mkv files.",
     )
 
+    parser.set_defaults(thinking=True)
     args = parser.parse_args()
 
     dotenv_loaded = load_dotenv_file(Path(".env"))
@@ -5337,12 +5386,6 @@ def main():
         args.thinking = False
 
     if is_ollama_provider(args.provider):
-        if args.thinking:
-            logger.info(
-                "Thinking mode is only supported for Gemini. Ignoring it for Ollama."
-            )
-        args.thinking = False
-
         if (args.audio_file or args.extract_audio) and not args.ocr:
             logger.warning(
                 "Audio-assisted translation is currently only supported with Gemini. Continuing without audio input."

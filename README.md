@@ -153,7 +153,6 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--doctor` - print config and provider/tool diagnostics
 - `--output-dir DIR` - output directory for translated files
 - `--batch-size N` - subtitle lines per batch
-- `--thinking` - enable thinking mode
 - `--no-thinking` - disable thinking mode
 - `--thinking-budget N` - token budget for thinking mode
 - `--progress-log` - save progress details to a log file
@@ -199,5 +198,6 @@ By default, files are written to `translated_subs/`:
 - ASS formatting is preserved mechanically, not just by prompt instructions
 - Audio-aware translation is mainly useful for gendered languages like Spanish
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
+- Thinking is enabled by default for supported models; use `--no-thinking` to disable it
 - OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages
