@@ -459,6 +459,34 @@ def resolve_mkv_input_files(input_path):
     raise ValueError(f"Path does not exist: {input_path}")
 
 
+def resolve_input_files(input_path):
+    """Resolve a file or directory input into supported MKV/raw subtitle files."""
+    if not input_path:
+        raise ValueError(
+            "You must provide a path to an .mkv, .ass, .ssa, or .srt file or directory."
+        )
+
+    if input_path.is_file():
+        if input_path.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS:
+            logging.debug(f"Processing single input file: {input_path.resolve()}")
+            return [input_path]
+        raise ValueError(
+            f"Unsupported input file: {input_path}. Supported: .mkv, .ass, .ssa, .srt"
+        )
+
+    if input_path.is_dir():
+        logger.info(f"Searching for supported input files in: {input_path.resolve()}")
+        return sorted(
+            [
+                entry
+                for entry in input_path.iterdir()
+                if entry.is_file() and entry.suffix.lower() in SUPPORTED_INPUT_EXTENSIONS
+            ]
+        )
+
+    raise ValueError(f"Path does not exist: {input_path}")
+
+
 def is_permanent_ollama_error(error_msg):
     """Detect non-retryable Ollama errors that should fail fast."""
     lower_msg = error_msg.lower()
@@ -1009,6 +1037,8 @@ SUPPORTED_SUBTITLE_CODECS = {
 }
 
 OCR_SUBTITLE_CODECS = {"S_HDMV/PGS"}
+RAW_TEXT_SUBTITLE_EXTENSIONS = {".ass", ".ssa", ".srt"}
+SUPPORTED_INPUT_EXTENSIONS = {".mkv"} | RAW_TEXT_SUBTITLE_EXTENSIONS
 
 
 def normalize_track_language(lang_code):
@@ -1032,6 +1062,14 @@ def normalize_track_language(lang_code):
         "french": "fr",
     }
     return aliases.get(normalized, normalized)
+
+
+def is_mkv_path(input_path):
+    return input_path.suffix.lower() == ".mkv"
+
+
+def is_raw_text_subtitle_path(input_path):
+    return input_path.suffix.lower() in RAW_TEXT_SUBTITLE_EXTENSIONS
 
 
 def prompt_yes_no(prompt, default=False):
@@ -4955,6 +4993,77 @@ def process_mkv_ocr_file(
         return batch_size
 
 
+def process_raw_subtitle_file(
+    subtitle_path,
+    output_dir,
+    api_manager,
+    model_name,
+    audio_model_name,
+    source_lang,
+    batch_size=300,
+    thinking=True,
+    thinking_budget=2048,
+    keep_original=False,
+    audio_file=None,
+    extract_audio=False,
+    free_quota=True,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    strip_sdh=False,
+):
+    """Translate a standalone text subtitle file directly."""
+    source_lang = normalize_track_language(source_lang)
+    print(f"\n{'=' * 60}")
+    print(f"Processing subtitle file: {subtitle_path.name}")
+    print(f"{'=' * 60}\n")
+
+    subtitle_extension = subtitle_path.suffix.lower()
+    expected_output_name = f"{subtitle_path.stem}.es-419{subtitle_extension}"
+    expected_output_path = output_dir / expected_output_name
+    if expected_output_path.exists():
+        logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
+        return batch_size
+
+    logger.info(f"Using source language {source_lang} for raw subtitle translation.")
+
+    if extract_audio:
+        logger.warning(
+            "--extract-audio requires a video input. Ignoring it for raw subtitle files."
+        )
+        extract_audio = False
+
+    translated_subtitle_path, final_batch_size = translate_ass_file(
+        subtitle_path,
+        api_manager,
+        model_name,
+        audio_model_name,
+        None,
+        None,
+        output_dir,
+        subtitle_path.stem,
+        source_lang,
+        subtitle_extension,
+        batch_size,
+        thinking,
+        thinking_budget,
+        keep_original,
+        audio_file,
+        extract_audio,
+        None,
+        free_quota,
+        temperature,
+        top_p,
+        top_k,
+        strip_sdh,
+    )
+
+    if translated_subtitle_path:
+        logger.success(f"Created translated subtitle file: {translated_subtitle_path.name}")
+
+    return final_batch_size
+
+
 def process_mkv_file(
     mkv_path,
     output_dir,
@@ -5104,10 +5213,11 @@ def main():
     signal.signal(signal.SIGTERM, handle_process_termination)
 
     parser = argparse.ArgumentParser(
-        description="Detects subtitles in .mkv files and translates them to Spanish using Google Gemini or Ollama.\n\n"
+        description="Detects subtitles in .mkv files or translates raw subtitle files to Spanish using Google Gemini or Ollama.\n\n"
         "Usage:\n"
-        "  %(prog)s <file.mkv>              # Process a single file\n"
-        "  %(prog)s <directory>             # Process all .mkv files in directory",
+        "  %(prog)s <file.mkv>              # Process a single MKV\n"
+        "  %(prog)s <file.ass>              # Translate a raw text subtitle file\n"
+        "  %(prog)s <directory>             # Process supported files in a directory",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -5196,7 +5306,7 @@ def main():
     parser.add_argument(
         "--ocr",
         action="store_true",
-        help="Use burned-in subtitle OCR instead of extracting subtitle tracks from the MKV.",
+        help="Use OCR for burned-in subtitles in MKVs.",
     )
     parser.add_argument(
         "--ocr-lang",
@@ -5299,7 +5409,7 @@ def main():
         nargs="?",
         default=None,
         type=Path,
-        help="Path to a single .mkv file or directory containing .mkv files.",
+        help="Path to a supported file (.mkv, .ass, .ssa, .srt) or a directory containing them.",
     )
 
     parser.set_defaults(thinking=True)
@@ -5532,11 +5642,8 @@ def main():
 
     # Pre-execution checks
     if not args.input_path:
-        logger.error("You must provide a path to an .mkv file or directory.")
+        logger.error("You must provide a supported file path or directory.")
         parser.print_help()
-        sys.exit(1)
-
-    if not check_mkvtoolnix():
         sys.exit(1)
 
     args.output_dir.mkdir(exist_ok=True)
@@ -5546,23 +5653,26 @@ def main():
 
     # File processing loop
     try:
-        files_to_process = resolve_mkv_input_files(args.input_path)
+        files_to_process = resolve_input_files(args.input_path)
     except ValueError as e:
         logger.error(str(e))
         sys.exit(1)
 
+    if any(is_mkv_path(file_path) for file_path in files_to_process) and not check_mkvtoolnix():
+        sys.exit(1)
+
     if not files_to_process:
-        logger.warning("No .mkv files found to process.")
+        logger.warning("No supported input files found to process.")
         return
 
     remembered_lang = None
     remembered_secondary_lang = None
     remembered_batch_size = args.batch_size
     for file_path in files_to_process:
-        if file_path.suffix == ".mkv":
-            # Set free_quota based on paid_quota flag (inverted logic)
-            free_quota = not args.paid_quota
+        final_batch_size = remembered_batch_size
+        free_quota = not args.paid_quota
 
+        if is_mkv_path(file_path):
             if args.ocr:
                 final_batch_size = process_mkv_ocr_file(
                     file_path,
@@ -5614,13 +5724,38 @@ def main():
                 if chosen_lang:
                     remembered_lang = chosen_lang
                 remembered_secondary_lang = chosen_secondary_lang
-
-            # Remember batch size adjustment for subsequent files
-            if final_batch_size and final_batch_size != remembered_batch_size:
-                logger.info(
-                    f"Batch size adjusted to {final_batch_size} - will use for remaining files"
+        elif is_raw_text_subtitle_path(file_path):
+            if args.ocr:
+                logger.warning(
+                    f"Skipping {file_path.name}: --ocr is only supported for MKV inputs."
                 )
-                remembered_batch_size = final_batch_size
+                continue
+
+            final_batch_size = process_raw_subtitle_file(
+                file_path,
+                args.output_dir,
+                api_manager,
+                args.model,
+                args.audio_model,
+                args.ocr_lang,
+                remembered_batch_size,
+                args.thinking,
+                args.thinking_budget,
+                args.keep_original,
+                args.audio_file,
+                args.extract_audio,
+                free_quota,
+                args.temperature,
+                args.top_p,
+                args.top_k,
+                args.strip_sdh,
+            )
+        # Remember batch size adjustment for subsequent files
+        if final_batch_size and final_batch_size != remembered_batch_size:
+            logger.info(
+                f"Batch size adjusted to {final_batch_size} - will use for remaining files"
+            )
+            remembered_batch_size = final_batch_size
 
     logger.success("--- All files processed. ---")
 

@@ -1,13 +1,13 @@
 # MKV Subtitle Translator
 
-Translate MKV subtitle tracks to Latin American Spanish and mux them back into the video.
+Translate MKV subtitle tracks or standalone subtitle files to Latin American Spanish.
 
 ## What It Does
 
 - Translates MKV subtitles to Latin American Spanish
-- Works with text subtitle tracks (`ASS`, `SSA`, `SRT`), hardcoded subtitles, and image subtitle tracks like `PGS`
+- Works with MKV subtitle tracks, standalone text subtitles (`ASS`, `SSA`, `SRT`), and OCR for hardcoded or image subtitle tracks like `PGS`
 - Supports Gemini and Ollama
-- Can mux the translated subtitles back into the video
+- Can mux translated subtitles back into MKVs
 
 ## Defaults
 
@@ -22,9 +22,8 @@ If the main translation model does not support audio input, Gemini audio fallbac
 
 ### System
 
-- `mkvmerge`
-- `mkvextract`
-- `ffmpeg` and `ffprobe` if you want audio-aware translation
+- `mkvmerge` and `mkvextract` for MKV workflows
+- `ffmpeg` and `ffprobe` for audio-aware translation or OCR mode
 
 Install examples:
 
@@ -78,10 +77,16 @@ Translate one file:
 python3 translator.py --api-key YOUR_KEY video.mkv
 ```
 
-Translate every MKV in a directory:
+Translate every supported file in a directory:
 
 ```bash
 python3 translator.py --api-key YOUR_KEY /path/to/videos
+```
+
+Translate a standalone subtitle file directly:
+
+```bash
+python3 translator.py --api-key YOUR_KEY episode01.ass
 ```
 
 ## Common Examples
@@ -142,7 +147,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 
 ## All Flags
 
-- `INPUT_PATH` - single `.mkv` file or a directory containing `.mkv` files
+- `INPUT_PATH` - single supported file (`.mkv`, `.ass`, `.ssa`, `.srt`) or a directory containing them
 - `--provider {gemini,ollama-local,ollama-cloud}` - select the LLM provider
 - `--base-url URL` - override the API base URL
 - `--api-key KEY` - primary API key for the selected provider
@@ -160,7 +165,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--no-colors` - disable colored terminal output
 - `--keep-original` - keep original text as hidden ASS comments during translation
 - `--add-original-only` - inject `{Original: ...}` into existing translated ASS output and rebuild the MKV
-- `--ocr` - extract burned-in subtitles with OCR instead of subtitle tracks
+- `--ocr` - extract burned-in subtitles with OCR for MKVs
 - `--ocr-lang CODE` - source language code for OCR subtitles before translation
 - `--ocr-crop X:Y:W:H` - OCR crop rectangle in pixels
 - `--ocr-full-frame` - OCR the full frame instead of the default bottom-third crop
@@ -168,6 +173,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--ocr-frame-diff FLOAT` - minimum grayscale change before re-running OCR on a sampled frame
 - `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
 - `--ocr-request-batch-size N` - number of images per OCR model request
+- `--ocr-max-items N` - limit OCR to the first N subtitle images for testing
 - `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
@@ -183,6 +189,7 @@ By default, files are written to `translated_subs/`:
 
 - `video.translated.mkv`
 - `video.es-419.ass` or `.srt` or `.ssa`
+- `subtitles.es-419.ass` or `.srt` or `.ssa` for standalone subtitle inputs
 - `video.translation.log` if `--progress-log` is enabled
 - `video.thoughts.log` if `--thoughts-log` is enabled
 
@@ -200,4 +207,8 @@ By default, files are written to `translated_subs/`:
 - Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
 - Thinking is enabled by default for supported models; use `--no-thinking` to disable it
 - OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
+- OCR mode currently uses Ollama vision models and is best treated as experimental
+- OCR frame extraction and OCR review sessions are cached under `tmp/` for reuse
+- The OCR review web UI pauses translation so you can correct OCR text before translation continues
+- GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the OCR model requests
 - Secondary subtitle context is optional and mainly useful when primary and reference subtitles are in different languages
