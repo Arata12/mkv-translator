@@ -55,25 +55,6 @@ def get_ocr_extract_cache_dir(mkv_path: Path) -> Path:
     return Path("tmp") / f"{mkv_path.stem}.ocr-extract"
 
 
-def parse_canvas_size(canvas_size: str):
-    """Parse a WIDTHxHEIGHT canvas size string."""
-    normalized = (canvas_size or "").strip().lower()
-    if "x" not in normalized:
-        raise ValueError("canvas size must use WIDTHxHEIGHT format")
-
-    width_str, height_str = normalized.split("x", 1)
-    try:
-        width = int(width_str)
-        height = int(height_str)
-    except ValueError as exc:
-        raise ValueError("canvas size must use WIDTHxHEIGHT format") from exc
-
-    if width <= 0 or height <= 0:
-        raise ValueError("canvas size values must be positive")
-
-    return width, height
-
-
 def _save_ocr_extract_cache(
     mkv_path: Path,
     crop_filter: str,
@@ -759,75 +740,6 @@ def extract_subtitle_bitmap_frames_full_stream(
     if progress_callback and len(samples) != last_reported:
         progress_callback(len(samples), max(expected_total or len(samples), 1))
 
-    return samples
-
-
-def extract_raw_pgs_frames_full_stream(
-    subtitle_path: Path,
-    canvas_size: str,
-    crop_filter: str,
-    progress_callback=None,
-):
-    """Render a standalone PGS .sup subtitle file onto a synthetic canvas."""
-    width, height = parse_canvas_size(canvas_size)
-    timestamps = get_subtitle_packet_timestamps(subtitle_path, 0)
-    if not timestamps:
-        raise RuntimeError("No PGS subtitle timestamps were found in the .sup file")
-
-    image_dir = get_ram_temp_dir("pgs_ocr_")
-    image_pattern = image_dir / "frame_%06d.png"
-    canvas_input = f"color=size={width}x{height}:rate=24000/1001:color=black@0.0,format=rgba"
-    filter_complex = f"[0:v][1:s:0]overlay,format=rgba,{crop_filter}[vout]"
-    command = [
-        "ffmpeg",
-        "-v",
-        "error",
-        "-nostats",
-        "-progress",
-        "pipe:1",
-        "-y",
-        "-f",
-        "lavfi",
-        "-i",
-        canvas_input,
-        "-i",
-        str(subtitle_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[vout]",
-        "-an",
-        "-vsync",
-        "vfr",
-        str(image_pattern),
-    ]
-
-    _run_ffmpeg_sequence_with_progress(
-        command,
-        image_dir,
-        ".png",
-        progress_callback=progress_callback,
-        progress_total=len(timestamps),
-    )
-
-    image_files = sorted(image_dir.glob("frame_*.png"))
-    if not image_files:
-        raise RuntimeError("No subtitle bitmap frames were extracted from the .sup file")
-
-    count = min(len(image_files), len(timestamps))
-    samples = []
-    for idx in range(count):
-        image_bytes = image_files[idx].read_bytes()
-        samples.append(
-            OCRFrameSample(
-                index=idx,
-                timestamp_s=timestamps[idx],
-                image_bytes=image_bytes,
-                image_hash=md5(image_bytes).hexdigest(),
-            )
-        )
-
-    shutil.rmtree(image_dir, ignore_errors=True)
     return samples
 
 
