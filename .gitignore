@@ -43,6 +43,7 @@ venv.bak/
 
 # Project specific
 tmp/
+tests/
 *.progress
 translated_subs/
 *.translated.mkv

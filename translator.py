@@ -67,7 +67,6 @@ try:
         extract_ocr_frames,
         extract_subtitle_bitmap_frames_full_stream,
         extract_subtitle_bitmap_frames_at_timestamps,
-        get_default_ocr_extract_workers,
         get_video_info,
         resolve_ocr_crop_filter,
         select_distinct_frame_samples,
@@ -105,6 +104,10 @@ GEMINI_DEFAULT_AUDIO_MODEL = "models/gemini-3.1-flash-lite-preview"
 OLLAMA_DEFAULT_MODEL = "llama3.2"
 GEMINI_FREE_TIER_MIN_INTERVAL_SECONDS = 5.0
 OCR_PROMPT_VERSION = 2
+OCR_DEFAULT_FPS = 2.0
+OCR_DEFAULT_FRAME_DIFF = 5.0
+OCR_DEFAULT_RECHECK_EVERY = 3
+OCR_DEFAULT_REQUEST_BATCH_SIZE = 24
 
 _gemini_request_lock = threading.Lock()
 _last_gemini_request_time = 0.0
@@ -4864,14 +4867,6 @@ def process_mkv_ocr_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
-    ocr_fps=2.0,
-    ocr_crop=None,
-    ocr_full_frame=False,
-    ocr_frame_diff=5.0,
-    ocr_recheck_every=3,
-    ocr_request_batch_size=24,
-    ocr_extract_workers=None,
-    ocr_max_items=None,
     skip_ocr_review=False,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
@@ -4911,9 +4906,7 @@ def process_mkv_ocr_file(
         )
 
         width, height, duration_s = get_video_info(mkv_path)
-        crop_filter = resolve_ocr_crop_filter(
-            width, height, crop_spec=ocr_crop, full_frame=ocr_full_frame
-        )
+        crop_filter = resolve_ocr_crop_filter(width, height)
         grouped_ocr_samples = []
         if ocr_track is not None:
             logger.log_only(
@@ -4997,7 +4990,7 @@ def process_mkv_ocr_file(
                 logger.info("Saved OCR frame extraction to cache for future reuse.")
 
             ocr_samples = select_distinct_image_samples(
-                frame_samples, recheck_every=ocr_recheck_every
+                frame_samples, recheck_every=OCR_DEFAULT_RECHECK_EVERY
             )
             grouped_ocr_samples = group_ocr_samples(frame_samples, ocr_samples)
             logger.log_only(
@@ -5018,14 +5011,14 @@ def process_mkv_ocr_file(
             logger.log_only(
                 "Falling back to direct video-frame OCR after user confirmation."
             )
-            estimated_frame_total = max(1, math.ceil(duration_s * ocr_fps))
+            estimated_frame_total = max(1, math.ceil(duration_s * OCR_DEFAULT_FPS))
             extraction_total = max(estimated_frame_total * 2, 1)
 
             cached_samples = _load_ocr_extract_cache(
                 mkv_path,
                 crop_filter=crop_filter,
                 ocr_mode="video_frame",
-                ocr_fps=ocr_fps,
+                ocr_fps=OCR_DEFAULT_FPS,
                 subtitle_stream_index=subtitle_stream_index,
             )
             if cached_samples is not None:
@@ -5068,7 +5061,7 @@ def process_mkv_ocr_file(
                 frame_samples = extract_ocr_frames(
                     mkv_path,
                     ocr_dir,
-                    ocr_fps,
+                    OCR_DEFAULT_FPS,
                     crop_filter,
                     subtitle_stream_index=subtitle_stream_index,
                     expected_total=estimated_frame_total,
@@ -5087,7 +5080,7 @@ def process_mkv_ocr_file(
                     mkv_path,
                     crop_filter=crop_filter,
                     ocr_mode="video_frame",
-                    ocr_fps=ocr_fps,
+                    ocr_fps=OCR_DEFAULT_FPS,
                     subtitle_stream_index=subtitle_stream_index,
                     frame_samples=frame_samples,
                 )
@@ -5095,8 +5088,8 @@ def process_mkv_ocr_file(
 
             ocr_samples = select_distinct_frame_samples(
                 frame_samples,
-                diff_threshold=ocr_frame_diff,
-                recheck_every=ocr_recheck_every,
+                diff_threshold=OCR_DEFAULT_FRAME_DIFF,
+                recheck_every=OCR_DEFAULT_RECHECK_EVERY,
             )
             grouped_ocr_samples = group_ocr_samples(frame_samples, ocr_samples)
             logger.log_only(
@@ -5105,16 +5098,6 @@ def process_mkv_ocr_file(
         if not ocr_samples:
             logger.error("No OCR frames were selected for analysis.")
             return batch_size
-
-        if ocr_max_items is not None and len(grouped_ocr_samples) > ocr_max_items:
-            grouped_ocr_samples = grouped_ocr_samples[:ocr_max_items]
-            ocr_samples = [representative for representative, _ in grouped_ocr_samples]
-            frame_samples = [
-                member for _, members in grouped_ocr_samples for member in members
-            ]
-            logger.warning(
-                f"OCR test limit enabled: processing only the first {len(ocr_samples)} OCR samples."
-            )
 
         logger.log_only(
             f"OCR extracted {len(frame_samples)} sampled frames and will OCR all {len(ocr_samples)} samples."
@@ -5142,11 +5125,11 @@ def process_mkv_ocr_file(
         )
 
         client = api_manager.get_client() if cached_distinct_count < len(ocr_samples) else None
-        total_batches = (len(ocr_samples) + ocr_request_batch_size - 1) // ocr_request_batch_size
+        total_batches = (len(ocr_samples) + OCR_DEFAULT_REQUEST_BATCH_SIZE - 1) // OCR_DEFAULT_REQUEST_BATCH_SIZE
         for batch_index, start in enumerate(
-            range(0, len(ocr_samples), ocr_request_batch_size), start=1
+            range(0, len(ocr_samples), OCR_DEFAULT_REQUEST_BATCH_SIZE), start=1
         ):
-            frame_batch = ocr_samples[start : start + ocr_request_batch_size]
+            frame_batch = ocr_samples[start : start + OCR_DEFAULT_REQUEST_BATCH_SIZE]
             progress_bar(
                 current=start,
                 total=len(ocr_samples),
@@ -5571,54 +5554,9 @@ def main():
         help="Source language code to use for OCR subtitles before translation (default: eng).",
     )
     parser.add_argument(
-        "--ocr-crop",
-        help="Crop rectangle for OCR in x:y:w:h pixels. Defaults to the bottom third of the frame.",
-    )
-    parser.add_argument(
-        "--ocr-full-frame",
-        action="store_true",
-        help="Run OCR on the full video frame instead of the default bottom-third crop.",
-    )
-    parser.add_argument(
-        "--ocr-fps",
-        type=float,
-        default=2.0,
-        help="Frame sampling rate for OCR before similarity filtering (default: 2.0).",
-    )
-    parser.add_argument(
-        "--ocr-frame-diff",
-        type=float,
-        default=5.0,
-        help="Mean grayscale difference required to OCR a new sampled frame (default: 5.0).",
-    )
-    parser.add_argument(
-        "--ocr-recheck-every",
-        type=int,
-        default=3,
-        help="Force a fresh OCR check after this many skipped sampled frames (default: 3).",
-    )
-    parser.add_argument(
-        "--ocr-request-batch-size",
-        type=int,
-        default=24,
-        help="Number of OCR images to send in one multimodal model request (default: 24).",
-    )
-    parser.add_argument(
-        "--ocr-max-items",
-        type=int,
-        default=None,
-        help="Limit OCR to the first N distinct subtitle images for testing/resume checks.",
-    )
-    parser.add_argument(
         "--skip-ocr-review",
         action="store_true",
         help="Skip the browser OCR review step and continue with raw OCR text.",
-    )
-    parser.add_argument(
-        "--ocr-extract-workers",
-        type=int,
-        default=get_default_ocr_extract_workers(),
-        help="Number of parallel ffmpeg workers to use for sparse subtitle-frame extraction (default: auto).",
     )
     parser.add_argument(
         "-a",
@@ -5726,26 +5664,6 @@ def main():
 
     if args.provider == "ollama-cloud" and not args.model:
         logger.error("ollama-cloud requires --model to be set explicitly")
-        sys.exit(1)
-
-    if args.ocr_fps <= 0:
-        logger.error("ocr-fps must be greater than 0")
-        sys.exit(1)
-
-    if args.ocr_request_batch_size <= 0:
-        logger.error("ocr-request-batch-size must be greater than 0")
-        sys.exit(1)
-
-    if args.ocr_max_items is not None and args.ocr_max_items <= 0:
-        logger.error("ocr-max-items must be greater than 0")
-        sys.exit(1)
-
-    if args.ocr_extract_workers <= 0:
-        logger.error("ocr-extract-workers must be greater than 0")
-        sys.exit(1)
-
-    if args.ocr_recheck_every < 0:
-        logger.error("ocr-recheck-every must be 0 or greater")
         sys.exit(1)
 
     # Handle thinking mode flags
@@ -5940,14 +5858,6 @@ def main():
                     top_p=args.top_p,
                     top_k=args.top_k,
                     strip_sdh=args.strip_sdh,
-                    ocr_fps=args.ocr_fps,
-                    ocr_crop=args.ocr_crop,
-                    ocr_full_frame=args.ocr_full_frame,
-                    ocr_frame_diff=args.ocr_frame_diff,
-                    ocr_recheck_every=args.ocr_recheck_every,
-                    ocr_request_batch_size=args.ocr_request_batch_size,
-                    ocr_extract_workers=args.ocr_extract_workers,
-                    ocr_max_items=args.ocr_max_items,
                     skip_ocr_review=args.skip_ocr_review,
                 )
             else:
