@@ -12,7 +12,7 @@ Translate MKV subtitle tracks or standalone subtitle files to Latin American Spa
 ## Defaults
 
 - Provider: `gemini`
-- Gemini translation model: `models/gemma-4-31b-it`
+- Gemini translation model: `models/gemma-4-26b-a4b-it`
 - Gemini audio fallback model: `models/gemini-3.1-flash-lite-preview`
 - Local Ollama default model: `llama3.2`
 
@@ -115,10 +115,16 @@ Use Ollama Cloud:
 python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model YOUR_MODEL video.mkv
 ```
 
-OCR hardcoded subtitles with Ollama Gemma:
+OCR hardcoded subtitles with Gemini:
 
 ```bash
-python3 translator.py --provider ollama-cloud --api-key YOUR_KEY --model gemma4:31b-cloud --ocr --ocr-lang eng video.mkv
+python3 translator.py --provider gemini --api-key YOUR_KEY --ocr --ocr-lang eng video.mkv
+```
+
+Skip the OCR review UI:
+
+```bash
+python3 translator.py --provider gemini --api-key YOUR_KEY --ocr --skip-ocr-review video.mkv
 ```
 
 Run diagnostics:
@@ -174,11 +180,11 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--ocr-recheck-every N` - force a fresh OCR pass after N skipped sampled frames
 - `--ocr-request-batch-size N` - number of images per OCR model request
 - `--ocr-max-items N` - limit OCR to the first N subtitle images for testing
+- `--skip-ocr-review` - skip the browser OCR review step
 - `--ocr-extract-workers N` - parallel ffmpeg workers for sparse subtitle-frame extraction
 - `-a, --audio-file FILE` - use an existing audio file for gender-aware translation
 - `--extract-audio` - extract audio from the MKV for gender-aware translation
 - `--strip-sdh` - remove SDH elements like speaker names and sound-effect captions
-- `--paid-quota` - remove artificial free-tier delays
 - `--temperature FLOAT` - sampling temperature
 - `--top-p FLOAT` - nucleus sampling value
 - `--top-k INT` - top-k sampling value
@@ -204,10 +210,9 @@ By default, files are written to `translated_subs/`:
 - The tool resumes interrupted work from `tmp/*.progress`
 - ASS formatting is preserved mechanically, not just by prompt instructions
 - Audio-aware translation is mainly useful for gendered languages like Spanish
-- Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode uses Ollama vision models
+- Ollama translation is text-only; Gemini still handles audio/gender hints, while OCR mode supports Gemini and Ollama vision models
 - Thinking is enabled by default for supported models; use `--no-thinking` to disable it
 - OCR review sessions can be resumed from `tmp/<name>.ocr-review/`
-- OCR mode currently uses Ollama vision models and is best treated as experimental
 - OCR frame extraction and OCR review sessions are cached under `tmp/` for reuse
 - The OCR review web UI pauses translation so you can correct OCR text before translation continues
 - GPU decode can help the frame-extraction side of OCR, but the dominant runtime cost is usually the OCR model requests

@@ -100,9 +100,14 @@ except ImportError:
 # --- API Manager for Dual API Key Support ---
 
 SUPPORTED_PROVIDERS = ("gemini", "ollama-local", "ollama-cloud")
-GEMINI_DEFAULT_MODEL = "models/gemma-4-31b-it"
+GEMINI_DEFAULT_MODEL = "models/gemma-4-26b-a4b-it"
 GEMINI_DEFAULT_AUDIO_MODEL = "models/gemini-3.1-flash-lite-preview"
 OLLAMA_DEFAULT_MODEL = "llama3.2"
+GEMINI_FREE_TIER_MIN_INTERVAL_SECONDS = 5.0
+OCR_PROMPT_VERSION = 2
+
+_gemini_request_lock = threading.Lock()
+_last_gemini_request_time = 0.0
 
 
 def is_gemini_provider(provider):
@@ -111,6 +116,10 @@ def is_gemini_provider(provider):
 
 def is_ollama_provider(provider):
     return provider in {"ollama-local", "ollama-cloud"}
+
+
+def is_ocr_capable_provider(provider):
+    return is_gemini_provider(provider) or is_ollama_provider(provider)
 
 
 def get_provider_display_name(provider):
@@ -139,6 +148,79 @@ def get_default_base_url(provider):
     if provider == "ollama-local":
         return os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
     return None
+
+
+def wait_for_gemini_request_slot(
+    provider,
+    min_interval=GEMINI_FREE_TIER_MIN_INTERVAL_SECONDS,
+):
+    """Throttle Gemini requests so OCR and translation stay paced."""
+    global _last_gemini_request_time
+
+    if not is_gemini_provider(provider):
+        return 0.0
+
+    with _gemini_request_lock:
+        now = time.time()
+        delay = max(0.0, min_interval - (now - _last_gemini_request_time))
+        if delay > 0:
+            time.sleep(delay)
+        _last_gemini_request_time = time.time()
+        return delay
+
+
+def get_ocr_session_metadata(provider, model_name):
+    return {
+        "provider": provider,
+        "model": model_name,
+        "prompt_version": OCR_PROMPT_VERSION,
+    }
+
+
+def infer_image_mime_type(image_bytes):
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    return "application/octet-stream"
+
+
+def group_ocr_samples(frame_samples, distinct_samples):
+    """Group every extracted sample under the distinct sample that represents it."""
+    if not frame_samples or not distinct_samples:
+        return []
+
+    distinct_by_index = {sample.index: sample for sample in distinct_samples}
+    groups = []
+    current_representative = None
+    current_members = []
+
+    for sample in frame_samples:
+        if sample.index in distinct_by_index:
+            if current_representative is not None and current_members:
+                groups.append((current_representative, current_members))
+            current_representative = distinct_by_index[sample.index]
+            current_members = [sample]
+            continue
+
+        if current_representative is None:
+            current_representative = distinct_samples[0]
+        current_members.append(sample)
+
+    if current_representative is not None and current_members:
+        groups.append((current_representative, current_members))
+
+    return groups
+
+
+def expand_grouped_ocr_text(grouped_samples, representative_text_cache):
+    """Copy OCR text from each representative sample to every grouped frame."""
+    expanded_cache = {}
+    for representative, members in grouped_samples:
+        text = representative_text_cache.get(representative.index, "")
+        for sample in members:
+            expanded_cache[sample.index] = text
+    return expanded_cache
 
 
 def extract_ollama_model_names(response):
@@ -1439,7 +1521,7 @@ def get_ocr_review_session_file(mkv_path):
     return Path("tmp") / f"{mkv_path.stem}.ocr-review" / "session.json"
 
 
-def load_saved_ocr_text_cache(mkv_path, samples):
+def load_saved_ocr_text_cache(mkv_path, samples, session_metadata=None):
     session_file = get_ocr_review_session_file(mkv_path)
     if not session_file.exists():
         return {}
@@ -1455,6 +1537,12 @@ def load_saved_ocr_text_cache(mkv_path, samples):
 
     if session_data.get("input_file") != str(mkv_path):
         return {}
+
+    if session_metadata:
+        saved_metadata = session_data.get("ocr_metadata") or {}
+        for key, expected_value in session_metadata.items():
+            if saved_metadata.get(key) != expected_value:
+                return {}
 
     items = session_data.get("items", [])
     saved_source_indexes = []
@@ -2562,6 +2650,7 @@ def analyze_audio_batch(
     heartbeat_thread.start()
 
     try:
+        wait_for_gemini_request_slot("gemini")
         with suppress_stderr_output():
             response = client.models.generate_content(
                 model=audio_model_name, contents=contents, config=config
@@ -2648,6 +2737,7 @@ def probe_audio_input_support(client, model_name, sample_batch, audio_part):
             ],
         )
     ]
+    wait_for_gemini_request_slot("gemini")
     with suppress_stderr_output():
         client.models.generate_content(
             model=model_name, contents=contents, config=config
@@ -3025,6 +3115,7 @@ def process_batch_streaming(
             if blocked:
                 break  # Exit retry loop if previously blocked
 
+            wait_for_gemini_request_slot(provider)
             response = client.models.generate_content_stream(
                 model=model_name, contents=contents, config=config
             )
@@ -3358,7 +3449,6 @@ def translate_ass_file(
     audio_file=None,
     extract_audio=False,
     video_path=None,
-    free_quota=True,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -3847,23 +3937,6 @@ def translate_ass_file(
         # Track quota error timing for smart API switching (gemini-srt-translator line 487)
         last_time = 0
 
-        # Rate limiting for free tier users with pro models (gemini-srt-translator lines 395-404)
-        delay = False
-        delay_time = 30
-
-        if is_gemini_provider(provider) and "pro" in model_name:
-            if free_quota:
-                delay = True
-                if not api_manager.has_secondary_key():
-                    logger.info("Pro model and free user quota detected.\n")
-                else:
-                    delay_time = 15
-                    logger.info(
-                        "Pro model and free user quota detected, using secondary API key if needed.\n"
-                    )
-            else:
-                logger.info("Paid quota mode enabled - no artificial rate limiting.\n")
-
         # Show initial progress bar (matching gemini-srt-translator line 460)
         progress_bar(current=i, total=total, model_name=model_name, is_sending=True)
 
@@ -3970,9 +4043,6 @@ def translate_ass_file(
                     is_sending=True,
                 )
 
-                # Track batch processing time for rate limiting (gemini-srt-translator line 537)
-                start_time = time.time()
-
                 previous_message = process_batch_streaming(
                     client=client,
                     model_name=model_name,
@@ -4024,11 +4094,6 @@ def translate_ass_file(
                 )
 
                 batch.clear()
-
-                # Apply rate limiting delay for free tier users (gemini-srt-translator lines 547-548)
-                end_time = time.time()
-                if delay and (end_time - start_time < delay_time) and i < total:
-                    time.sleep(delay_time - (end_time - start_time))
 
             except Exception as e:
                 error_msg = str(e)
@@ -4391,6 +4456,105 @@ def run_ocr_batch_ollama(
     return [by_ordinal.get(i, "") for i in range(len(frame_batch))]
 
 
+def parse_gemini_ocr_payload(response):
+    """Parse structured Gemini OCR responses with a text fallback."""
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, dict):
+        return parsed
+
+    response_text = getattr(response, "text", "") or ""
+    if not response_text.strip():
+        raise ValueError("OCR model returned an empty response")
+
+    parsed = json_repair.loads(response_text)
+    if isinstance(parsed, dict):
+        return parsed
+    raise ValueError("OCR response did not contain a JSON object")
+
+
+def run_ocr_batch_gemini(
+    client,
+    model_name,
+    frame_batch,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Extract burned-in subtitle text from one image batch using Gemini."""
+    response_schema = {
+        "type": "object",
+        "properties": {
+            "results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "ordinal": {"type": "integer"},
+                        "text": {"type": "string"},
+                    },
+                    "required": ["ordinal", "text"],
+                },
+            }
+        },
+        "required": ["results"],
+    }
+    user_prompt = (
+        f"There are {len(frame_batch)} images attached in order from ordinal 0 to {len(frame_batch) - 1}. "
+        "Read subtitle text exactly as shown in each image. "
+        "Do not translate, explain, or summarize. "
+        "Ignore logos, watermarks, UI, credits, and background scene details. "
+        "Return JSON with one field named results. "
+        "results must contain exactly one object per image. "
+        "Each object must contain ordinal (integer) and text (string). "
+        "Use an empty string only when an image truly has no readable subtitle text. "
+        "Preserve subtitle line breaks using \\n inside text."
+    )
+    parts = [types.Part.from_text(text=user_prompt)]
+    for sample in frame_batch:
+        image_bytes = sample.get_image_bytes()
+        parts.append(
+            types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=infer_image_mime_type(image_bytes),
+            )
+        )
+
+    config_kwargs = {
+        "response_mime_type": "application/json",
+        "response_json_schema": response_schema,
+        "temperature": 0 if temperature is None else temperature,
+        "system_instruction": "You are an OCR extractor for burned-in subtitle images.",
+    }
+    if top_p is not None:
+        config_kwargs["top_p"] = top_p
+    if top_k is not None:
+        config_kwargs["top_k"] = top_k
+
+    wait_for_gemini_request_slot("gemini")
+    with suppress_stderr_output():
+        response = client.models.generate_content(
+            model=model_name,
+            contents=parts,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+
+    parsed = parse_gemini_ocr_payload(response)
+    results = parsed.get("results") if isinstance(parsed, dict) else None
+    if not isinstance(results, list):
+        raise ValueError("OCR response did not contain a results array")
+
+    by_ordinal = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        ordinal = item.get("ordinal")
+        text = item.get("text")
+        if isinstance(ordinal, int) and isinstance(text, str):
+            by_ordinal[ordinal] = text
+
+    return [by_ordinal.get(i, "") for i in range(len(frame_batch))]
+
+
 def run_ocr_single_image_strict(
     client,
     model_name,
@@ -4446,8 +4610,63 @@ def run_ocr_single_image_strict(
     raise ValueError("Strict OCR response did not contain a text field")
 
 
+def run_ocr_single_image_strict_gemini(
+    client,
+    model_name,
+    sample,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+):
+    """Retry one Gemini OCR image with a stricter prompt when empty text looks suspicious."""
+    response_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+    image_bytes = sample.get_image_bytes()
+    config_kwargs = {
+        "response_mime_type": "application/json",
+        "response_json_schema": response_schema,
+        "temperature": 0 if temperature is None else temperature,
+        "system_instruction": (
+            "You are an OCR extractor for subtitle images. "
+            "If there is any visible subtitle text at all, transcribe it exactly. "
+            "Only return an empty string when the image truly contains no readable subtitle glyphs."
+        ),
+    }
+    if top_p is not None:
+        config_kwargs["top_p"] = top_p
+    if top_k is not None:
+        config_kwargs["top_k"] = top_k
+
+    contents = [
+        types.Part.from_text(
+            text="Return JSON with one field named text. Preserve subtitle line breaks using \\n."
+        ),
+        types.Part.from_bytes(
+            data=image_bytes,
+            mime_type=infer_image_mime_type(image_bytes),
+        ),
+    ]
+
+    wait_for_gemini_request_slot("gemini")
+    with suppress_stderr_output():
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=types.GenerateContentConfig(**config_kwargs),
+        )
+
+    parsed = parse_gemini_ocr_payload(response)
+    if isinstance(parsed, dict) and isinstance(parsed.get("text"), str):
+        return parsed["text"]
+    raise ValueError("Strict OCR response did not contain a text field")
+
+
 def repair_empty_ocr_results(
     client,
+    provider,
     model_name,
     frame_batch,
     texts,
@@ -4461,22 +4680,33 @@ def repair_empty_ocr_results(
         if text:
             continue
         try:
-            retried = run_ocr_single_image_strict(
-                client,
-                model_name,
-                frame_batch[idx],
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-            )
+            if is_gemini_provider(provider):
+                retried = run_ocr_single_image_strict_gemini(
+                    client,
+                    model_name,
+                    frame_batch[idx],
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
+            else:
+                retried = run_ocr_single_image_strict(
+                    client,
+                    model_name,
+                    frame_batch[idx],
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                )
             repaired[idx] = retried
         except Exception as exc:
             logger.log_only(f"Strict OCR retry failed for one image: {exc}")
     return repaired
 
 
-def run_ocr_batch_ollama_resilient(
+def run_ocr_batch_resilient(
     client,
+    provider,
     model_name,
     frame_batch,
     temperature=None,
@@ -4486,16 +4716,27 @@ def run_ocr_batch_ollama_resilient(
 ):
     """Run OCR with automatic batch splitting when the model returns bad output."""
     try:
-        texts = run_ocr_batch_ollama(
-            client,
-            model_name,
-            frame_batch,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-        )
+        if is_gemini_provider(provider):
+            texts = run_ocr_batch_gemini(
+                client,
+                model_name,
+                frame_batch,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
+        else:
+            texts = run_ocr_batch_ollama(
+                client,
+                model_name,
+                frame_batch,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+            )
         return repair_empty_ocr_results(
             client,
+            provider,
             model_name,
             frame_batch,
             texts,
@@ -4509,8 +4750,9 @@ def run_ocr_batch_ollama_resilient(
                 f"OCR batch of {len(frame_batch)} failed ({exc}). Retrying {retries_remaining} more time(s)."
             )
             time.sleep(2)
-            return run_ocr_batch_ollama_resilient(
+            return run_ocr_batch_resilient(
                 client,
+                provider,
                 model_name,
                 frame_batch,
                 temperature=temperature,
@@ -4528,8 +4770,9 @@ def run_ocr_batch_ollama_resilient(
         logger.log_only(
             f"OCR batch of {len(frame_batch)} failed ({exc}). Retrying as {midpoint} + {len(frame_batch) - midpoint}."
         )
-        left = run_ocr_batch_ollama_resilient(
+        left = run_ocr_batch_resilient(
             client,
+            provider,
             model_name,
             frame_batch[:midpoint],
             temperature=temperature,
@@ -4537,8 +4780,9 @@ def run_ocr_batch_ollama_resilient(
             top_k=top_k,
             retries_remaining=2,
         )
-        right = run_ocr_batch_ollama_resilient(
+        right = run_ocr_batch_resilient(
             client,
+            provider,
             model_name,
             frame_batch[midpoint:],
             temperature=temperature,
@@ -4551,6 +4795,7 @@ def run_ocr_batch_ollama_resilient(
 
 def run_ocr_batch_with_progress(
     client,
+    provider,
     model_name,
     frame_batch,
     current,
@@ -4590,8 +4835,9 @@ def run_ocr_batch_with_progress(
     heartbeat_thread.start()
 
     try:
-        return run_ocr_batch_ollama_resilient(
+        return run_ocr_batch_resilient(
             client,
+            provider,
             model_name,
             frame_batch,
             temperature=temperature,
@@ -4614,7 +4860,6 @@ def process_mkv_ocr_file(
     thinking=True,
     thinking_budget=2048,
     keep_original=False,
-    free_quota=True,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -4627,6 +4872,7 @@ def process_mkv_ocr_file(
     ocr_request_batch_size=24,
     ocr_extract_workers=None,
     ocr_max_items=None,
+    skip_ocr_review=False,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
     print(f"\n{'=' * 60}")
@@ -4639,8 +4885,8 @@ def process_mkv_ocr_file(
         logger.info(f"Output file '{expected_output_name}' already exists. Skipping.")
         return batch_size
 
-    if not is_ollama_provider(api_manager.provider):
-        logger.error("--ocr currently requires an Ollama provider with image support.")
+    if not is_ocr_capable_provider(api_manager.provider):
+        logger.error("--ocr requires a provider with image support.")
         return batch_size
 
     if not check_ffmpeg_tools():
@@ -4668,6 +4914,7 @@ def process_mkv_ocr_file(
         crop_filter = resolve_ocr_crop_filter(
             width, height, crop_spec=ocr_crop, full_frame=ocr_full_frame
         )
+        grouped_ocr_samples = []
         if ocr_track is not None:
             logger.log_only(
                 f"Rendering subtitle track id={ocr_track.get('id')} ({selected_ocr_lang}) directly into OCR bitmaps."
@@ -4749,9 +4996,12 @@ def process_mkv_ocr_file(
                 )
                 logger.info("Saved OCR frame extraction to cache for future reuse.")
 
-            ocr_samples = list(frame_samples)
+            ocr_samples = select_distinct_image_samples(
+                frame_samples, recheck_every=ocr_recheck_every
+            )
+            grouped_ocr_samples = group_ocr_samples(frame_samples, ocr_samples)
             logger.log_only(
-                f"Prepared {len(ocr_samples)} subtitle bitmap frames for OCR without deduplication."
+                f"Prepared {len(frame_samples)} subtitle bitmap frames and selected {len(ocr_samples)} distinct OCR samples."
             )
         else:
             selected_ocr_lang = ocr_lang
@@ -4843,18 +5093,25 @@ def process_mkv_ocr_file(
                 )
                 logger.info("Saved OCR frame extraction to cache for future reuse.")
 
-            ocr_samples = list(frame_samples)
+            ocr_samples = select_distinct_frame_samples(
+                frame_samples,
+                diff_threshold=ocr_frame_diff,
+                recheck_every=ocr_recheck_every,
+            )
+            grouped_ocr_samples = group_ocr_samples(frame_samples, ocr_samples)
             logger.log_only(
-                f"Prepared {len(ocr_samples)} sampled video frames for OCR without deduplication."
+                f"Prepared {len(frame_samples)} sampled video frames and selected {len(ocr_samples)} distinct OCR samples."
             )
         if not ocr_samples:
             logger.error("No OCR frames were selected for analysis.")
             return batch_size
 
-        if ocr_max_items is not None and len(ocr_samples) > ocr_max_items:
-            ocr_samples = ocr_samples[:ocr_max_items]
-            allowed_indexes = {sample.index for sample in ocr_samples}
-            frame_samples = [sample for sample in frame_samples if sample.index in allowed_indexes]
+        if ocr_max_items is not None and len(grouped_ocr_samples) > ocr_max_items:
+            grouped_ocr_samples = grouped_ocr_samples[:ocr_max_items]
+            ocr_samples = [representative for representative, _ in grouped_ocr_samples]
+            frame_samples = [
+                member for _, members in grouped_ocr_samples for member in members
+            ]
             logger.warning(
                 f"OCR test limit enabled: processing only the first {len(ocr_samples)} OCR samples."
             )
@@ -4863,7 +5120,12 @@ def process_mkv_ocr_file(
             f"OCR extracted {len(frame_samples)} sampled frames and will OCR all {len(ocr_samples)} samples."
         )
 
-        ocr_text_cache = load_saved_ocr_text_cache(mkv_path, ocr_samples)
+        session_metadata = get_ocr_session_metadata(api_manager.provider, model_name)
+        ocr_text_cache = {}
+        if not skip_ocr_review:
+            ocr_text_cache = load_saved_ocr_text_cache(
+                mkv_path, ocr_samples, session_metadata
+            )
         cached_distinct_count = len(ocr_text_cache)
         if cached_distinct_count:
             logger.info(
@@ -4902,6 +5164,7 @@ def process_mkv_ocr_file(
             if uncached_pairs:
                 uncached_texts = run_ocr_batch_with_progress(
                     client,
+                    api_manager.provider,
                     model_name,
                     [sample for sample, _ in uncached_pairs],
                     current=start,
@@ -4926,21 +5189,23 @@ def process_mkv_ocr_file(
             if batch_index == 1 or batch_index == total_batches or batch_index % 5 == 0:
                 logger.log_only(f"OCR batches completed: {batch_index}/{total_batches}")
 
-        observed_text = [
-            (sample.timestamp_s, ocr_text_cache.get(sample.index, ""))
-            for sample in frame_samples
-        ]
+        if skip_ocr_review:
+            corrected_text_cache = dict(ocr_text_cache)
+        else:
+            logger.info("Opening OCR review UI before subtitle translation...")
+            corrected_text_cache = review_ocr_text_in_webui(
+                mkv_path=mkv_path,
+                distinct_samples=ocr_samples,
+                initial_text_by_hash=ocr_text_cache,
+                logger=logger,
+                session_metadata=session_metadata,
+            )
 
-        logger.info("Opening OCR review UI before subtitle translation...")
-        corrected_text_cache = review_ocr_text_in_webui(
-            mkv_path=mkv_path,
-            distinct_samples=ocr_samples,
-            initial_text_by_hash=ocr_text_cache,
-            logger=logger,
+        expanded_text_cache = expand_grouped_ocr_text(
+            grouped_ocr_samples, corrected_text_cache
         )
-
         observed_text = [
-            (sample.timestamp_s, corrected_text_cache.get(sample.index, ""))
+            (sample.timestamp_s, expanded_text_cache.get(sample.index, ""))
             for sample in frame_samples
         ]
 
@@ -4977,7 +5242,6 @@ def process_mkv_ocr_file(
             None,
             False,
             mkv_path,
-            free_quota,
             temperature,
             top_p,
             top_k,
@@ -5006,7 +5270,6 @@ def process_raw_subtitle_file(
     keep_original=False,
     audio_file=None,
     extract_audio=False,
-    free_quota=True,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -5051,7 +5314,6 @@ def process_raw_subtitle_file(
         audio_file,
         extract_audio,
         None,
-        free_quota,
         temperature,
         top_p,
         top_k,
@@ -5078,7 +5340,6 @@ def process_mkv_file(
     keep_original=False,
     audio_file=None,
     extract_audio=False,
-    free_quota=True,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -5090,9 +5351,6 @@ def process_mkv_file(
     Returns tuple: (primary language code, secondary language code, final batch size)
     to be remembered for subsequent files.
 
-    Args:
-        free_quota: If True (default), apply rate limiting for free tier users.
-                   If False (--paid-quota), remove artificial delays for paid users.
     """
     print(f"\n{'=' * 60}")
     print(f"Processing: {mkv_path.name}")
@@ -5176,7 +5434,6 @@ def process_mkv_file(
             audio_file,
             extract_audio,
             mkv_path,  # video_path for audio extraction
-            free_quota,
             temperature,
             top_p,
             top_k,
@@ -5242,7 +5499,7 @@ def main():
     parser.add_argument(
         "--model",
         default=None,
-        help="The model to use for translation. Defaults to 'models/gemma-4-31b-it' for Gemini and 'llama3.2' for local Ollama. Ollama Cloud requires an explicit model.",
+        help="The model to use for translation. Defaults to 'models/gemma-4-26b-a4b-it' for Gemini and 'llama3.2' for local Ollama. Ollama Cloud requires an explicit model.",
     )
     parser.add_argument(
         "--audio-model",
@@ -5353,6 +5610,11 @@ def main():
         help="Limit OCR to the first N distinct subtitle images for testing/resume checks.",
     )
     parser.add_argument(
+        "--skip-ocr-review",
+        action="store_true",
+        help="Skip the browser OCR review step and continue with raw OCR text.",
+    )
+    parser.add_argument(
         "--ocr-extract-workers",
         type=int,
         default=get_default_ocr_extract_workers(),
@@ -5374,11 +5636,6 @@ def main():
         "--strip-sdh",
         action="store_true",
         help="Remove SDH (Subtitles for Deaf/Hard of Hearing) elements like [sound effects], speaker names, and music symbols.",
-    )
-    parser.add_argument(
-        "--paid-quota",
-        action="store_true",
-        help="Remove artificial rate limits for paid quota users (allows faster processing).",
     )
     parser.add_argument(
         "--temperature",
@@ -5513,11 +5770,6 @@ def main():
                 "--api-key2 is only used for Gemini quota failover and will be ignored for Ollama."
             )
 
-        if args.paid_quota:
-            logger.info(
-                "--paid-quota only affects Gemini rate limiting and will be ignored for Ollama."
-            )
-
     # Validate thinking_budget
     if args.thinking_budget < 0 or args.thinking_budget > 24576:
         logger.error("thinking-budget must be between 0 and 24576")
@@ -5621,8 +5873,8 @@ def main():
             )
         sys.exit(1)
 
-    if args.ocr and not is_ollama_provider(args.provider):
-        logger.error("--ocr currently requires an Ollama provider with image support.")
+    if args.ocr and not is_ocr_capable_provider(args.provider):
+        logger.error("--ocr requires a provider with image support.")
         sys.exit(1)
 
     # Handle --list-models before checking other args
@@ -5670,34 +5922,33 @@ def main():
     remembered_batch_size = args.batch_size
     for file_path in files_to_process:
         final_batch_size = remembered_batch_size
-        free_quota = not args.paid_quota
 
         if is_mkv_path(file_path):
             if args.ocr:
                 final_batch_size = process_mkv_ocr_file(
-                    file_path,
-                    args.output_dir,
-                    api_manager,
-                    args.model,
-                    args.audio_model,
-                    args.ocr_lang,
-                    remembered_batch_size,
-                    args.thinking,
-                    args.thinking_budget,
-                    args.keep_original,
-                    free_quota,
-                    args.temperature,
-                    args.top_p,
-                    args.top_k,
-                    args.strip_sdh,
-                    args.ocr_fps,
-                    args.ocr_crop,
-                    args.ocr_full_frame,
-                    args.ocr_frame_diff,
-                    args.ocr_recheck_every,
-                    args.ocr_request_batch_size,
-                    args.ocr_extract_workers,
-                    args.ocr_max_items,
+                    mkv_path=file_path,
+                    output_dir=args.output_dir,
+                    api_manager=api_manager,
+                    model_name=args.model,
+                    audio_model_name=args.audio_model,
+                    ocr_lang=args.ocr_lang,
+                    batch_size=remembered_batch_size,
+                    thinking=args.thinking,
+                    thinking_budget=args.thinking_budget,
+                    keep_original=args.keep_original,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    strip_sdh=args.strip_sdh,
+                    ocr_fps=args.ocr_fps,
+                    ocr_crop=args.ocr_crop,
+                    ocr_full_frame=args.ocr_full_frame,
+                    ocr_frame_diff=args.ocr_frame_diff,
+                    ocr_recheck_every=args.ocr_recheck_every,
+                    ocr_request_batch_size=args.ocr_request_batch_size,
+                    ocr_extract_workers=args.ocr_extract_workers,
+                    ocr_max_items=args.ocr_max_items,
+                    skip_ocr_review=args.skip_ocr_review,
                 )
             else:
                 chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
@@ -5714,7 +5965,6 @@ def main():
                     args.keep_original,
                     args.audio_file,
                     args.extract_audio,
-                    free_quota,
                     args.temperature,
                     args.top_p,
                     args.top_k,
@@ -5744,7 +5994,6 @@ def main():
                 args.keep_original,
                 args.audio_file,
                 args.extract_audio,
-                free_quota,
                 args.temperature,
                 args.top_p,
                 args.top_k,

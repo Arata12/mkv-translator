@@ -12,7 +12,7 @@ from pathlib import Path
 from tools.ocr_utils import normalize_ocr_text
 
 
-REVIEW_SESSION_VERSION = 4
+REVIEW_SESSION_VERSION = 5
 
 
 def _detect_browser_host():
@@ -68,13 +68,20 @@ def _write_session_file(session_file: Path, payload):
         json.dump(payload, handle, indent=2, ensure_ascii=False)
 
 
-def _session_matches_expected(session_data, mkv_path: Path, expected_source_groups):
+def _session_matches_expected(
+    session_data, mkv_path: Path, expected_source_groups, expected_metadata=None
+):
     if not isinstance(session_data, dict):
         return False
     if session_data.get("version") != REVIEW_SESSION_VERSION:
         return False
     if session_data.get("input_file") != str(mkv_path):
         return False
+    if expected_metadata:
+        saved_metadata = session_data.get("ocr_metadata") or {}
+        for key, expected_value in expected_metadata.items():
+            if saved_metadata.get(key) != expected_value:
+                return False
 
     saved_source_groups = [
         item.get("source_indexes") or [item.get("source_index")]
@@ -189,12 +196,19 @@ def _build_review_items(distinct_samples, initial_text_by_hash, images_dir: Path
     return items
 
 
-def _build_new_session(mkv_path: Path, distinct_samples, initial_text_by_hash, session_dir: Path):
+def _build_new_session(
+    mkv_path: Path,
+    distinct_samples,
+    initial_text_by_hash,
+    session_dir: Path,
+    session_metadata=None,
+):
     images_dir = session_dir / "images"
     items = _build_review_items(distinct_samples, initial_text_by_hash, images_dir)
     return {
         "version": REVIEW_SESSION_VERSION,
         "input_file": str(mkv_path),
+        "ocr_metadata": dict(session_metadata or {}),
         "created_at": time.time(),
         "updated_at": time.time(),
         "completed": False,
@@ -203,11 +217,15 @@ def _build_new_session(mkv_path: Path, distinct_samples, initial_text_by_hash, s
     }
 
 
-def _upgrade_session_data(session_data, initial_text_by_hash):
+def _upgrade_session_data(session_data, initial_text_by_hash, session_metadata=None):
     if not isinstance(session_data, dict):
         return session_data
 
     changed = False
+    if session_metadata is not None and session_data.get("ocr_metadata") != session_metadata:
+        session_data["ocr_metadata"] = dict(session_metadata)
+        changed = True
+
     for item in session_data.get("items", []):
         if "source_indexes" not in item:
             item["source_indexes"] = [item.get("source_index", item.get("review_index", 0))]
@@ -1282,7 +1300,13 @@ def _make_handler(controller: OCRReviewController):
     return OCRReviewHandler
 
 
-def review_ocr_text_in_webui(mkv_path: Path, distinct_samples, initial_text_by_hash, logger):
+def review_ocr_text_in_webui(
+    mkv_path: Path,
+    distinct_samples,
+    initial_text_by_hash,
+    logger,
+    session_metadata=None,
+):
     session_dir = Path("tmp") / f"{mkv_path.stem}.ocr-review"
     session_dir.mkdir(parents=True, exist_ok=True)
     session_file = session_dir / "session.json"
@@ -1295,8 +1319,17 @@ def review_ocr_text_in_webui(mkv_path: Path, distinct_samples, initial_text_by_h
     if session_file.exists():
         try:
             loaded = _read_session_file(session_file)
-            if _session_matches_expected(loaded, mkv_path, expected_source_groups):
-                session_data, upgraded = _upgrade_session_data(loaded, initial_text_by_hash)
+            if _session_matches_expected(
+                loaded,
+                mkv_path,
+                expected_source_groups,
+                expected_metadata=session_metadata,
+            ):
+                session_data, upgraded = _upgrade_session_data(
+                    loaded,
+                    initial_text_by_hash,
+                    session_metadata=session_metadata,
+                )
                 if upgraded:
                     _write_session_file(session_file, session_data)
         except Exception as exc:
@@ -1319,6 +1352,7 @@ def review_ocr_text_in_webui(mkv_path: Path, distinct_samples, initial_text_by_h
             distinct_samples=distinct_samples,
             initial_text_by_hash=initial_text_by_hash,
             session_dir=session_dir,
+            session_metadata=session_metadata,
         )
         _write_session_file(session_file, session_data)
 
