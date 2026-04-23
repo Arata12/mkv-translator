@@ -103,6 +103,12 @@ Use Gemini explicitly:
 python3 translator.py --provider gemini --api-key YOUR_KEY video.mkv
 ```
 
+Use an extra context file:
+
+```bash
+python3 translator.py --provider gemini --api-key YOUR_KEY --extra-context notes.txt video.mkv
+```
+
 Use local Ollama:
 
 ```bash
@@ -164,6 +170,7 @@ python3 tools/remux_corrected_subs.py translated_subs --dry-run
 - `--doctor` - print config and provider/tool diagnostics
 - `--output-dir DIR` - output directory for translated files
 - `--batch-size N` - subtitle lines per batch
+- `--extra-context FILE` - optional UTF-8 text file with extra translation context (`.txt` recommended)
 - `--no-thinking` - disable thinking mode
 - `--thinking-budget N` - token budget for thinking mode
 - `--progress-log` - save progress details to a log file

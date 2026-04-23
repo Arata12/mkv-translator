@@ -321,6 +321,16 @@ def load_dotenv_file(env_path):
     return loaded
 
 
+def load_extra_context_file(context_path):
+    """Load optional user-supplied translation context from a text file."""
+    if not context_path:
+        return None
+
+    with open(context_path, "r", encoding="utf-8") as handle:
+        loaded = handle.read().strip()
+    return loaded or None
+
+
 def mask_secret(value):
     """Return a masked representation of a secret value."""
     if not value:
@@ -1741,6 +1751,7 @@ def get_system_instruction(
     audio_file=None,
     gender_hints=False,
     reference_lang=None,
+    extra_context_text=None,
 ):
     """
     Generate system instruction for translation.
@@ -1838,6 +1849,15 @@ Do not let reference_content push an ambiguous line toward masculine if the main
 Always prioritize the main {source_lang} content when there is a conflict.
 Before finalizing the batch, mentally verify each translation against reference_content and the surrounding batch context.
 Do not translate the reference_content field itself into the output."""
+
+    if extra_context_text:
+        instruction += f"""
+
+Additional user-requested context:
+{extra_context_text}
+
+Use this context only as supporting guidance.
+Do not invent facts that are not present in the source line, nearby lines, or this extra context."""
 
     instruction += thinking_instruction
 
@@ -3452,6 +3472,7 @@ def translate_ass_file(
     audio_file=None,
     extract_audio=False,
     video_path=None,
+    extra_context_text=None,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -3846,6 +3867,7 @@ def translate_ass_file(
             audio_file=audio_file if not use_audio_fallback else None,
             gender_hints=use_audio_fallback,
             reference_lang=reference_lang_code,
+            extra_context_text=extra_context_text,
         )
 
         config = get_translation_config(
@@ -4121,6 +4143,7 @@ def translate_ass_file(
                         audio_file=None,
                         gender_hints=True,
                         reference_lang=reference_lang_code,
+                        extra_context_text=extra_context_text,
                     )
                     config = get_translation_config(
                         system_instruction,
@@ -4863,6 +4886,7 @@ def process_mkv_ocr_file(
     thinking=True,
     thinking_budget=2048,
     keep_original=False,
+    extra_context_text=None,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -5225,6 +5249,7 @@ def process_mkv_ocr_file(
             None,
             False,
             mkv_path,
+            extra_context_text,
             temperature,
             top_p,
             top_k,
@@ -5253,6 +5278,7 @@ def process_raw_subtitle_file(
     keep_original=False,
     audio_file=None,
     extract_audio=False,
+    extra_context_text=None,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -5297,6 +5323,7 @@ def process_raw_subtitle_file(
         audio_file,
         extract_audio,
         None,
+        extra_context_text,
         temperature,
         top_p,
         top_k,
@@ -5323,6 +5350,7 @@ def process_mkv_file(
     keep_original=False,
     audio_file=None,
     extract_audio=False,
+    extra_context_text=None,
     temperature=None,
     top_p=None,
     top_k=None,
@@ -5417,6 +5445,7 @@ def process_mkv_file(
             audio_file,
             extract_audio,
             mkv_path,  # video_path for audio extraction
+            extra_context_text,
             temperature,
             top_p,
             top_k,
@@ -5510,6 +5539,12 @@ def main():
         type=int,
         default=300,
         help="Number of lines to translate per batch (default: 300).",
+    )
+    parser.add_argument(
+        "--extra-context",
+        type=Path,
+        default=None,
+        help="Optional UTF-8 text file with extra translation context (.txt recommended).",
     )
     parser.add_argument(
         "--no-thinking", action="store_true", help="Disable thinking mode."
@@ -5652,6 +5687,14 @@ def main():
         sys.exit(1)
 
     args.base_url = args.base_url or os.environ.get("LLM_BASE_URL")
+
+    extra_context_text = None
+    if args.extra_context:
+        try:
+            extra_context_text = load_extra_context_file(args.extra_context)
+        except Exception as e:
+            logger.error(f"Failed to load extra context file: {e}")
+            sys.exit(1)
 
     args.model = (
         args.model or os.environ.get("LLM_MODEL") or get_default_model(args.provider)
@@ -5854,6 +5897,7 @@ def main():
                     thinking=args.thinking,
                     thinking_budget=args.thinking_budget,
                     keep_original=args.keep_original,
+                    extra_context_text=extra_context_text,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     top_k=args.top_k,
@@ -5875,6 +5919,7 @@ def main():
                     args.keep_original,
                     args.audio_file,
                     args.extract_audio,
+                    extra_context_text,
                     args.temperature,
                     args.top_p,
                     args.top_k,
@@ -5892,22 +5937,23 @@ def main():
                 continue
 
             final_batch_size = process_raw_subtitle_file(
-                file_path,
-                args.output_dir,
-                api_manager,
-                args.model,
-                args.audio_model,
-                args.ocr_lang,
-                remembered_batch_size,
-                args.thinking,
-                args.thinking_budget,
-                args.keep_original,
-                args.audio_file,
-                args.extract_audio,
-                args.temperature,
-                args.top_p,
-                args.top_k,
-                args.strip_sdh,
+                subtitle_path=file_path,
+                output_dir=args.output_dir,
+                api_manager=api_manager,
+                model_name=args.model,
+                audio_model_name=args.audio_model,
+                source_lang=args.ocr_lang,
+                batch_size=remembered_batch_size,
+                thinking=args.thinking,
+                thinking_budget=args.thinking_budget,
+                keep_original=args.keep_original,
+                audio_file=args.audio_file,
+                extract_audio=args.extract_audio,
+                extra_context_text=extra_context_text,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                strip_sdh=args.strip_sdh,
             )
         # Remember batch size adjustment for subsequent files
         if final_batch_size and final_batch_size != remembered_batch_size:
