@@ -952,6 +952,77 @@ def is_sdh_only_line(text):
     return False
 
 
+def _normalize_inline_color(match):
+    """Normalize a single inline color tag (\\c, \\1c, etc.)."""
+    tag = match.group(1)  # 'c' or '1c' or '2c' or '3c' or '4c'
+    color_hex = match.group(2)  # Just the hex digits
+
+    # Remove any non-hex characters that slipped through
+    clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_hex)
+
+    if not clean_hex:
+        # Invalid/empty color - remove the tag entirely
+        return ""
+
+    # Parse hex value
+    try:
+        color_value = int(clean_hex, 16)
+    except ValueError:
+        # Should never happen after cleaning, but be safe
+        return ""
+
+    # Normalize to proper length (pad with zeros if needed)
+    # 6 digits = RGB, 8 digits = ARGB
+    if len(clean_hex) <= 6:
+        # RGB format - pad to 6 digits
+        normalized = f"&H{color_value:06X}&"
+    else:
+        # ARGB format - pad to 8 digits
+        normalized = f"&H{color_value:08X}&"
+
+    return f"\\{tag}{normalized}"
+
+
+def _normalize_style_line(match):
+    """Normalize colors in a Style: line."""
+    line = match.group(0)
+
+    # Find and normalize each color value in the style
+    # Pattern: color values start with &H or H or just hex digits
+    def fix_style_color(color_match):
+        color_str = color_match.group(0)
+
+        # Extract just hex digits
+        clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_str)
+
+        if not clean_hex or len(clean_hex) > 8:
+            # Invalid - use white with full opacity as safe default
+            return "&H00FFFFFF"
+
+        try:
+            color_value = int(clean_hex, 16)
+            # Style colors should be 8 digits (AABBGGRR)
+            # If shorter, assume RGB and add full opacity (00)
+            if len(clean_hex) <= 6:
+                return f"&H00{color_value:06X}"
+            else:
+                return f"&H{color_value:08X}"
+        except ValueError:
+            return "&H00FFFFFF"  # Safe default
+
+    # Match color values in style (anywhere in the line after "Style:")
+    # These are typically &HAABBGGRR or malformed versions
+    # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
+    line = re.sub(
+        r"(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)",
+        fix_style_color,
+        line,
+        flags=re.IGNORECASE,
+    )
+
+    return line
+
+
 def normalize_ass_colors(ass_path):
     """
     Normalize ALL ASS color codes to spec-compliant format in a single pass.
@@ -977,120 +1048,59 @@ def normalize_ass_colors(ass_path):
     """
     try:
         with open(ass_path, "r", encoding="utf-8-sig") as f:
-            content = f.read()
+            lines = f.readlines()
 
-        original_content = content
+        new_lines = []
+        changed = False
 
-        # === Inline Color Tag Normalization ===
-        # Matches: \c, \1c, \2c, \3c, \4c followed by color in any format
-        # Pattern breakdown:
-        # - \\(\d?c) : Matches \c or \1c-\4c
-        # - (?:&H?)?([0-9A-Fa-f]+)&? : Matches color with optional &H and trailing &
+        for line in lines:
+            # Skip lines that contain vector drawing commands (\p1, \p2, etc.)
+            # Drawing data contains numeric coordinates that can be confused with color values
+            if re.search(r'\\p[1-4](?!\d)', line):
+                # This line has drawing commands - skip color normalization entirely
+                # to avoid corrupting coordinate data
+                new_lines.append(line)
+                continue
 
-        def normalize_inline_color(match):
-            """Normalize a single inline color tag."""
-            tag = match.group(1)  # 'c' or '1c' or '2c' or '3c' or '4c'
-            color_hex = match.group(2)  # Just the hex digits
+            new_line = line
 
-            # Remove any non-hex characters that slipped through
-            clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_hex)
-
-            if not clean_hex:
-                # Invalid/empty color - remove the tag entirely
-                return ""
-
-            # Parse hex value
-            try:
-                color_value = int(clean_hex, 16)
-            except ValueError:
-                # Should never happen after cleaning, but be safe
-                return ""
-
-            # Normalize to proper length (pad with zeros if needed)
-            # 6 digits = RGB, 8 digits = ARGB
-            if len(clean_hex) <= 6:
-                # RGB format - pad to 6 digits
-                normalized = f"&H{color_value:06X}&"
-            else:
-                # ARGB format - pad to 8 digits
-                normalized = f"&H{color_value:08X}&"
-
-            return f"\\{tag}{normalized}"
-
-        # Replace all inline color tags
-        # This pattern matches all variations: \c..., \1c..., \2c..., \3c..., \4c...
-        content = re.sub(
-            r"\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])",
-            normalize_inline_color,
-            content,
-            flags=re.IGNORECASE,
-        )
-
-        # === Style Line Color Normalization ===
-        # Style lines have colors in specific comma-separated positions
-        # Format: Style: Name,Font,Size,PrimaryColour,SecondaryColour,OutlineColour,BackColour,...
-
-        def normalize_style_line(match):
-            """Normalize colors in a Style: line."""
-            line = match.group(0)
-
-            # Find and normalize each color value in the style
-            # Pattern: color values start with &H or H or just hex digits
-            def fix_style_color(color_match):
-                color_str = color_match.group(0)
-
-                # Extract just hex digits
-                clean_hex = re.sub(r"[^0-9A-Fa-f]", "", color_str)
-
-                if not clean_hex or len(clean_hex) > 8:
-                    # Invalid - use white with full opacity as safe default
-                    return "&H00FFFFFF"
-
-                try:
-                    color_value = int(clean_hex, 16)
-                    # Style colors should be 8 digits (AABBGGRR)
-                    # If shorter, assume RGB and add full opacity (00)
-                    if len(clean_hex) <= 6:
-                        return f"&H00{color_value:06X}"
-                    else:
-                        return f"&H{color_value:08X}"
-                except ValueError:
-                    return "&H00FFFFFF"  # Safe default
-
-            # Match color values in style (anywhere in the line after "Style:")
-            # These are typically &HAABBGGRR or malformed versions
-            # CRITICAL: &? before lookahead to match trailing & (e.g., FFFFFF&,)
-            line = re.sub(
-                r"(?:&H?|H)?[0-9A-Fa-f]{6,8}&?(?=\s*,|\s*$)",
-                fix_style_color,
-                line,
+            # === Inline Color Tag Normalization ===
+            new_line = re.sub(
+                r"\\(\d?c)(?:&H?)?([0-9A-Fa-f]+)&?(?![0-9A-Fa-f])",
+                _normalize_inline_color,
+                new_line,
                 flags=re.IGNORECASE,
             )
 
-            return line
+            # === Style Line Color Normalization ===
+            if new_line.startswith("Style:"):
+                new_line = re.sub(
+                    r"^Style:.*$",
+                    _normalize_style_line,
+                    new_line,
+                    flags=re.MULTILINE | re.IGNORECASE,
+                )
 
-        # Normalize all Style: lines
-        content = re.sub(
-            r"^Style:.*$",
-            normalize_style_line,
-            content,
-            flags=re.MULTILINE | re.IGNORECASE,
-        )
+            if new_line != line:
+                changed = True
+            new_lines.append(new_line)
 
         # === Cleanup Pass ===
         # Remove any orphaned/incomplete color tags that might cause issues
         # These are patterns that look like color tags but are too malformed to fix
+        result = "".join(new_lines)
 
         # Remove standalone \c or \Xc without any hex following
-        content = re.sub(r"\\(\d?c)(?![&0-9A-Fa-f])", "", content)
+        result = re.sub(r"\\(\d?c)(?![&0-9A-Fa-f])", "", result)
 
         # Fix any remaining double ampersands
-        content = re.sub(r"&&+", "&", content)
+        result = re.sub(r"&&+", "&", result)
 
         # === Write if changed ===
-        if content != original_content:
+        original_content = "".join(lines)
+        if result != original_content:
             with open(ass_path, "w", encoding="utf-8-sig") as f:
-                f.write(content)
+                f.write(result)
             logging.debug(f"Normalized ASS color codes in {ass_path.name}")
             return True
 
@@ -2528,13 +2538,68 @@ def build_resume_context(
     ]
 
 
+def _parse_ass_timestamp(ts_str):
+    """Parse ASS timestamp (H:MM:SS.CC or 0:00:00.00) to milliseconds."""
+    ts_str = ts_str.strip()
+    # Remove any trailing non-numeric junk (e.g., color codes mixed in)
+    ts_str = re.sub(r'[^0-9.:].*$', '', ts_str).strip()
+    try:
+        parts = ts_str.split(':')
+        if len(parts) == 3:
+            h, m, s = parts
+            return int(h) * 3600000 + int(m) * 60000 + int(float(s) * 1000)
+        elif len(parts) == 2:
+            m, s = parts
+            return int(m) * 60000 + int(float(s) * 1000)
+    except (ValueError, IndexError):
+        pass
+    return None
+
+
+def _parse_ass_file_manually(ass_path):
+    """
+    Fallback ASS parser for when pysubs2 fails (e.g., malformed drawing commands,
+    corrupted timestamps from color normalization, etc.).
+    Returns a list of pysubs2.SSAEvent-like dicts with start, end, text fields.
+    """
+    entries = []
+    try:
+        with open(ass_path, 'r', encoding='utf-8-sig') as f:
+            for line in f:
+                line = line.strip()
+                if not line.lower().startswith('dialogue:'):
+                    continue
+                # Dialogue: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+                # Remove the "Dialogue:" prefix and split
+                rest = line[len('dialogue:'):].lstrip()
+                # Split on commas, but preserve the text field (which may contain commas)
+                fields = rest.split(',', 9)
+                if len(fields) < 10:
+                    continue
+                start_ms = _parse_ass_timestamp(fields[1])
+                end_ms = _parse_ass_timestamp(fields[2])
+                if start_ms is None or end_ms is None:
+                    continue
+                text = fields[9]
+                # Skip drawing commands
+                if r'\p1' in text or r'\p2' in text or r'\p3' in text or r'\p4' in text:
+                    continue
+                entries.append({
+                    'start': start_ms,
+                    'end': end_ms,
+                    'text': text,
+                })
+    except Exception as e:
+        logging.warning(f"Manual ASS fallback parser also failed for {ass_path}: {e}")
+    return entries
+
+
 def load_reference_subtitle_entries(subtitle_path, strip_sdh=False):
     """Load simplified dialogue entries from a secondary subtitle file."""
     if not subtitle_path:
         return []
 
     normalize_ass_colors(subtitle_path)
-    subs = pysubs2.load(str(subtitle_path))
 
     ass_header_keywords = [
         "[Script Info]",
@@ -2552,37 +2617,72 @@ def load_reference_subtitle_entries(subtitle_path, strip_sdh=False):
     ]
 
     entries = []
-    for event in subs:
-        if not hasattr(event, "type") or event.type != "Dialogue":
-            continue
+    try:
+        subs = pysubs2.load(str(subtitle_path))
 
-        if (
-            r"\p1" in event.text
-            or r"\p2" in event.text
-            or r"\p3" in event.text
-            or r"\p4" in event.text
-        ):
-            continue
-
-        if any(keyword in event.text for keyword in ass_header_keywords):
-            continue
-
-        plain_text = remove_formatting(event.text)
-        if not plain_text:
-            continue
-
-        if strip_sdh:
-            plain_text = strip_sdh_elements(plain_text)
-            if not plain_text or is_sdh_only_line(plain_text):
+        for event in subs:
+            if not hasattr(event, "type") or event.type != "Dialogue":
                 continue
 
-        entries.append(
-            {
-                "start": event.start,
-                "end": event.end,
-                "content": plain_text.strip(),
-            }
+            if (
+                r"\p1" in event.text
+                or r"\p2" in event.text
+                or r"\p3" in event.text
+                or r"\p4" in event.text
+            ):
+                continue
+
+            if any(keyword in event.text for keyword in ass_header_keywords):
+                continue
+
+            plain_text = remove_formatting(event.text)
+            if not plain_text:
+                continue
+
+            if strip_sdh:
+                plain_text = strip_sdh_elements(plain_text)
+                if not plain_text or is_sdh_only_line(plain_text):
+                    continue
+
+            entries.append(
+                {
+                    "start": event.start,
+                    "end": event.end,
+                    "content": plain_text.strip(),
+                }
+            )
+    except Exception as e:
+        logging.warning(
+            f"pysubs2 failed to parse {subtitle_path.name}: {e}. Trying manual fallback parser."
         )
+        # Fallback: parse ASS manually to extract what we can
+        fallback_entries = _parse_ass_file_manually(subtitle_path)
+        for entry in fallback_entries:
+            text = entry['text']
+            if any(keyword in text for keyword in ass_header_keywords):
+                continue
+            plain_text = remove_formatting(text)
+            if not plain_text:
+                continue
+            if strip_sdh:
+                plain_text = strip_sdh_elements(plain_text)
+                if not plain_text or is_sdh_only_line(plain_text):
+                    continue
+            entries.append(
+                {
+                    "start": entry['start'],
+                    "end": entry['end'],
+                    "content": plain_text.strip(),
+                }
+            )
+        if fallback_entries and not entries:
+            logging.warning(
+                f"Manual fallback parser found {len(fallback_entries)} lines but none passed filters"
+            )
+        elif entries:
+            logging.info(
+                f"Manual fallback parser recovered {len(entries)} dialogue entries from {subtitle_path.name}"
+            )
 
     return entries
 
