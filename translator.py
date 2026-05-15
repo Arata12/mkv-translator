@@ -1879,38 +1879,38 @@ def get_review_system_instruction(source_lang, target_lang="Latin American Spani
     Generate system instruction for the translation review pass.
     Reviews gender agreement, consistency, untranslated leaks, and register issues.
     """
-    instruction = f"""You are a translation quality reviewer for subtitles translated from {source_lang} to {target_lang}.
+    instruction = f"""You are a meticulous translation proofreader. You will review subtitles translated from {source_lang} to {target_lang} and fix every real error you find.
 
-You will receive a JSON array of objects, each with:
-- index: a string identifier
-- original: the source text
-- translated: the translated text
+INPUT FORMAT — a JSON array where each object has:
+- index: line number (string)
+- original: source text
+- translated: current translation
 
-Your job is to find translation errors and return a JSON array of corrections. Only flag lines that have actual errors — do NOT flag stylistic preferences if the translation is already correct.
+Carefully compare each original against its translation. Check for:
+1. **Gender agreement**: Adjectives, past participles, and verbs must match the speaker's established gender. "Ella está cansada" is correct for a woman; "Ella está cansado" is an error. Use surrounding lines and context to determine who is speaking or being spoken about.
+2. **Untranslated source text**: Any word or phrase left in {source_lang} that belongs in {target_lang}. Proper nouns and intentional loanwords are fine; everything else must be translated.
+3. **Terminology consistency**: The same concept, name, or term should be translated the same way every time. "Chairman Park" should not become "Director Park" halfway through.
+4. **Register consistency**: If a character uses tú with someone, keep tú. If usted, keep usted. A sudden switch without reason is an error.
+5. **Pronoun and reference errors**: Wrong gender on pronouns, dangling references, or subject-verb disagreements.
 
-Check for these specific issues:
-1. **Gender agreement**: If context or nearby lines establish a speaker's gender (e.g., feminine verb forms, adjectives), later lines addressing or describing that same person must keep consistent gender. Spanish adjective/verb agreement must match (e.g., "cansada" for female, "cansado" for male). Do NOT flag lines where gender is genuinely ambiguous.
-2. **Untranslated source text**: Lines that were left in {source_lang} when they should have been translated to {target_lang}. Proper nouns and deliberate loanwords are fine.
-3. **Terminology inconsistency**: The same term or name is translated differently across lines without reason (e.g., a character name spelled two ways).
-4. **Register inconsistency**: Sudden shifts between formal (usted) and informal (tú) for the same speaker/addressee without contextual justification.
-5. **Pronoun/reference errors**: Incorrect pronouns (e.g., using "él" when referring to a female character established in nearby lines).
+Be thorough. A single wrong gender ending or missed untranslated word is a real, noticeable error — flag it. It is better to over-correct than to let mistakes through.
 
-Return a JSON array of correction objects with these fields:
-- index: the index of the line to correct
-- corrected: the corrected translation text
-- reason: brief reason for the correction
+OUTPUT FORMAT — a JSON array of objects:
+- index: the line index (string) to correct
+- corrected: the full corrected line with all formatting preserved
+- reason: short explanation of what was wrong
 
-If no corrections are needed, return an empty array: []
+Preserve all ASS override tags exactly ({{\\\\an8}}, {{\\\\i1}}, {{\\\\b0}}, colors, positions, etc.). Preserve \\\\N line breaks. Only change the translation text itself.
 
-Only correct actual errors. Preserve all ASS formatting tags like {{\\an8}}, {{\\i1}}, etc. exactly as they are. Preserve line breaks with \\N."""
+Do NOT return an empty array unless every single line is truly correct. Most translations have at least a few real errors."""
 
     if extra_context_text:
         instruction += f"""
 
-Additional user-requested context:
+Additional context about this subtitle file:
 {extra_context_text}
 
-Use this context to help resolve ambiguous gender references, character identities, and naming consistency across the subtitle file."""
+Use this to identify character genders, relationships, and proper terminology."""
 
     return instruction
 
@@ -2103,7 +2103,7 @@ def review_translation(
                 )
                 response_text = response.text
             else:
-                # Ollama path
+                # Ollama path — use streaming to avoid timeouts on cloud models
                 ollama_messages = [
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": user_message},
@@ -2111,13 +2111,22 @@ def review_translation(
                 ollama_options = config.get("options", {})
                 think = config.get("think", False)
 
-                response = client.chat(
-                    model=model_name,
-                    messages=ollama_messages,
-                    think=think,
-                    options=ollama_options,
-                )
-                response_text = response.message.content
+                chat_kwargs = {
+                    "model": model_name,
+                    "messages": ollama_messages,
+                    "stream": True,
+                    "format": config.get("format", "json"),
+                    "think": think,
+                }
+                if ollama_options:
+                    chat_kwargs["options"] = ollama_options
+
+                response = client.chat(**chat_kwargs)
+                response_text = ""
+                for chunk in response:
+                    chunk_text = extract_ollama_chunk_text(chunk)
+                    if chunk_text:
+                        response_text += chunk_text
 
             # Parse the corrections
             try:
