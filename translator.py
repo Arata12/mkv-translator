@@ -3786,7 +3786,7 @@ def translate_ass_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
-    review=False,
+    review=None,
     review_batch_size=150,
 ):
     """
@@ -4592,7 +4592,16 @@ def translate_ass_file(
             event.text = restore_formatting(original_texts[i], restored_directives)
 
         # --- Review pass: check for gender, consistency, and quality issues ---
-        if review:
+        # review: True=always, False=never, None=ask interactively
+        should_review = review
+        if should_review is None:
+            clear_progress()
+            should_review = prompt_yes_no(
+                "Translation complete. Run AI review pass to check for gender agreement, "
+                "consistency, and other issues?",
+                default=False,
+            )
+        if should_review:
             try:
                 review_corrections = review_translation(
                     dialogue_events=dialogue_events,
@@ -5226,7 +5235,7 @@ def process_mkv_ocr_file(
     top_k=None,
     strip_sdh=False,
     skip_ocr_review=False,
-    review=False,
+    review=None,
     review_batch_size=150,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
@@ -5621,7 +5630,7 @@ def process_raw_subtitle_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
-    review=False,
+    review=None,
     review_batch_size=150,
 ):
     """Translate a standalone text subtitle file directly."""
@@ -5697,7 +5706,7 @@ def process_mkv_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
-    review=False,
+    review=None,
     review_batch_size=150,
 ):
     """
@@ -5959,14 +5968,20 @@ def main():
     parser.add_argument(
         "--review",
         action="store_true",
-        help="After translation, run a review pass to check for gender agreement, "
-        "consistency, untranslated leaks, and register issues.",
+        default=False,
+        help="After translation, always run the review pass (skip the prompt). "
+        "If neither --review nor --no-review is given, you will be asked interactively.",
+    )
+    parser.add_argument(
+        "--no-review",
+        action="store_true",
+        help="Skip the translation review pass entirely (never review).",
     )
     parser.add_argument(
         "--review-batch-size",
         type=int,
         default=150,
-        help="Number of lines per review batch (default: 150). Only used with --review.",
+        help="Number of lines per review batch (default: 150). Only used when review is enabled.",
     )
     parser.add_argument(
         "--temperature",
@@ -6070,6 +6085,17 @@ def main():
     # Handle thinking mode flags
     if args.no_thinking:
         args.thinking = False
+
+    # Handle review flags: --review=True, --no-review=False, neither=None (ask)
+    if args.review and args.no_review:
+        logger.error("--review and --no-review are mutually exclusive.")
+        sys.exit(1)
+    if args.review:
+        args.review = True
+    elif args.no_review:
+        args.review = False
+    else:
+        args.review = None  # ask interactively
 
     if is_ollama_provider(args.provider):
         if (args.audio_file or args.extract_audio) and not args.ocr:
