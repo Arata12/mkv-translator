@@ -1864,6 +1864,315 @@ Do not invent facts that are not present in the source line, nearby lines, or th
     return instruction
 
 
+def get_review_system_instruction(source_lang, target_lang="Latin American Spanish", extra_context_text=None):
+    """
+    Generate system instruction for the translation review pass.
+    Reviews gender agreement, consistency, untranslated leaks, and register issues.
+    """
+    instruction = f"""You are a translation quality reviewer for subtitles translated from {source_lang} to {target_lang}.
+
+You will receive a JSON array of objects, each with:
+- index: a string identifier
+- original: the source text
+- translated: the translated text
+
+Your job is to find translation errors and return a JSON array of corrections. Only flag lines that have actual errors — do NOT flag stylistic preferences if the translation is already correct.
+
+Check for these specific issues:
+1. **Gender agreement**: If context or nearby lines establish a speaker's gender (e.g., feminine verb forms, adjectives), later lines addressing or describing that same person must keep consistent gender. Spanish adjective/verb agreement must match (e.g., "cansada" for female, "cansado" for male). Do NOT flag lines where gender is genuinely ambiguous.
+2. **Untranslated source text**: Lines that were left in {source_lang} when they should have been translated to {target_lang}. Proper nouns and deliberate loanwords are fine.
+3. **Terminology inconsistency**: The same term or name is translated differently across lines without reason (e.g., a character name spelled two ways).
+4. **Register inconsistency**: Sudden shifts between formal (usted) and informal (tú) for the same speaker/addressee without contextual justification.
+5. **Pronoun/reference errors**: Incorrect pronouns (e.g., using "él" when referring to a female character established in nearby lines).
+
+Return a JSON array of correction objects with these fields:
+- index: the index of the line to correct
+- corrected: the corrected translation text
+- reason: brief reason for the correction
+
+If no corrections are needed, return an empty array: []
+
+Only correct actual errors. Preserve all ASS formatting tags like {{\\an8}}, {{\\i1}}, etc. exactly as they are. Preserve line breaks with \\N."""
+
+    if extra_context_text:
+        instruction += f"""
+
+Additional user-requested context:
+{extra_context_text}
+
+Use this context to help resolve ambiguous gender references, character identities, and naming consistency across the subtitle file."""
+
+    return instruction
+
+
+def get_review_config(system_instruction, model_name, thinking=True, thinking_budget=2048, temperature=None, top_p=None, top_k=None, provider="gemini"):
+    """Build API configuration for the translation review pass."""
+    if is_gemini_provider(provider):
+        response_schema = types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "index": types.Schema(type=types.Type.STRING),
+                    "corrected": types.Schema(type=types.Type.STRING),
+                    "reason": types.Schema(type=types.Type.STRING),
+                },
+                required=["index", "corrected", "reason"],
+            ),
+        )
+
+        thinking_compatible = (
+            "2.5" in model_name or "2.0" in model_name or "gemini-3" in model_name
+        )
+        thinking_budget_compatible = "flash" in model_name
+
+        thinking_config = None
+        if thinking_compatible and thinking:
+            thinking_config = types.ThinkingConfig(
+                include_thoughts=True,
+                thinking_budget=thinking_budget if thinking_budget_compatible else None,
+            )
+
+        return types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=response_schema,
+            safety_settings=get_safety_settings(),
+            system_instruction=system_instruction,
+            thinking_config=thinking_config,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+
+    return {
+        "provider": provider,
+        "system_instruction": system_instruction,
+        "think": get_ollama_think_value(model_name, thinking, thinking_budget),
+        "format": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "string"},
+                    "corrected": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["index", "corrected", "reason"],
+            },
+        },
+        "options": {
+            key: value
+            for key, value in {
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            }.items()
+            if value is not None
+        },
+    }
+
+
+def review_translation(
+    dialogue_events,
+    original_texts,
+    translated_subtitle,
+    source_lang,
+    target_lang,
+    api_manager,
+    model_name,
+    thinking=True,
+    thinking_budget=2048,
+    extra_context_text=None,
+    temperature=None,
+    top_p=None,
+    top_k=None,
+    review_batch_size=150,
+):
+    """
+    Review translated subtitles for gender, consistency, and quality issues.
+
+    Sends batches of (original, translated) pairs to the LLM and applies
+    any corrections returned.
+
+    Args:
+        dialogue_events: List of ASS subtitle events
+        original_texts: List of original (stripped) texts for each event
+        translated_subtitle: List of translated texts for each event
+        source_lang: Source language name/code
+        target_lang: Target language name (default "Latin American Spanish")
+        api_manager: APIManager instance for LLM calls
+        model_name: Model to use for review
+        thinking: Whether to enable thinking mode
+        thinking_budget: Token budget for thinking
+        extra_context_text: Optional extra context from user
+        temperature: Sampling temperature
+        top_p: Nucleus sampling
+        top_k: Top-K sampling
+        review_batch_size: Lines per review batch (default 150)
+
+    Returns:
+        Number of corrections applied
+    """
+    from tools.progress_display import progress_bar, progress_complete, clear_progress
+
+    provider = api_manager.provider
+    client = api_manager.get_client()
+
+    system_instruction = get_review_system_instruction(
+        source_lang, target_lang, extra_context_text=extra_context_text
+    )
+    config = get_review_config(
+        system_instruction, model_name,
+        thinking=thinking, thinking_budget=thinking_budget,
+        temperature=temperature, top_p=top_p, top_k=top_k,
+        provider=provider,
+    )
+
+    total_lines = len(dialogue_events)
+    total_corrections = 0
+
+    logger.info(f"Reviewing {total_lines} translated lines for quality issues...")
+
+    # Build index->position map for fast lookup
+    # Process in batches for context
+    for batch_start in range(0, total_lines, review_batch_size):
+        batch_end = min(batch_start + review_batch_size, total_lines)
+        batch_indices = list(range(batch_start, batch_end))
+
+        # Build the review payload
+        review_items = []
+        for i in batch_indices:
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            review_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+
+        # Include overlap context: add a few lines before and after for cross-batch consistency
+        overlap_before = max(0, batch_start - 5)
+        overlap_after = min(total_lines, batch_end + 5)
+        # Overlap lines are sent as context but not marked for correction
+        context_items = []
+        for i in range(overlap_before, batch_start):
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            context_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+        for i in range(batch_end, overlap_after):
+            orig = original_texts[i] if i < len(original_texts) else ""
+            trans = translated_subtitle[i] if i < len(translated_subtitle) else ""
+            context_items.append({
+                "index": str(i),
+                "original": orig,
+                "translated": trans,
+            })
+
+        # Combine: context + review items
+        all_items = context_items[:5] + review_items + context_items[5:]
+        # Mark which indices are reviewable (batch range)
+        reviewable_indices = set(str(i) for i in batch_indices)
+
+        progress_bar(current=batch_start, total=total_lines, model_name=model_name, task_label="Reviewing")
+
+        json_payload = json.dumps(all_items, ensure_ascii=False)
+
+        # Build the user message
+        user_message = f"Review the following subtitle translation batch. Lines with indices {min(batch_indices)}-{max(batch_indices)} are the ones to check. Surrounding lines are context only — do NOT correct context lines, only lines in the target range.\n\n{json_payload}"
+
+        try:
+            if is_gemini_provider(provider):
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=user_message,
+                    config=config,
+                )
+                response_text = response.text
+            else:
+                # Ollama path
+                ollama_messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_message},
+                ]
+                ollama_options = config.get("options", {})
+                think = config.get("think", False)
+
+                response = client.chat(
+                    model=model_name,
+                    messages=ollama_messages,
+                    think=think,
+                    options=ollama_options,
+                )
+                response_text = response.message.content
+
+            # Parse the corrections
+            try:
+                corrections = json_repair.loads(response_text)
+            except Exception:
+                corrections = json.loads(response_text)
+
+            if not isinstance(corrections, list):
+                corrections = []
+
+            # Apply corrections (only for indices in the reviewable range)
+            batch_corrections = 0
+            for correction in corrections:
+                idx_str = str(correction.get("index", ""))
+                if idx_str not in reviewable_indices:
+                    continue
+                idx = int(idx_str)
+                corrected_text = correction.get("corrected", "")
+                reason = correction.get("reason", "")
+                if not corrected_text:
+                    continue
+                if idx < 0 or idx >= len(translated_subtitle):
+                    continue
+
+                old_text = translated_subtitle[idx]
+                if corrected_text != old_text:
+                    translated_subtitle[idx] = corrected_text
+                    # Also update the event text (restore formatting will be re-applied)
+                    if dialogue_events and idx < len(dialogue_events):
+                        # Re-apply ASS formatting restoration to the corrected text
+                        restored_directives = restore_ass_directives(corrected_text)
+                        dialogue_events[idx].text = restore_formatting(
+                            original_texts[idx], restored_directives
+                        )
+                    batch_corrections += 1
+                    logging.info(
+                        f"  Review corrected line {idx}: {reason}"
+                    )
+                    logging.debug(
+                        f"    Old: {old_text!r}\n    New: {corrected_text!r}"
+                    )
+
+            total_corrections += batch_corrections
+            if batch_corrections > 0:
+                logger.info(
+                    f"  Review batch {batch_start // review_batch_size + 1}: "
+                    f"{batch_corrections} correction(s) applied"
+                )
+
+        except Exception as e:
+            logger.warning(f"Review batch failed (non-fatal): {e}")
+            # Review is best-effort; continue with the next batch
+
+    progress_complete(total_lines, total_lines, model_name)
+
+    if total_corrections > 0:
+        logger.success(
+            f"Review complete: {total_corrections} correction(s) applied across {total_lines} lines"
+        )
+    else:
+        logger.info("Review complete: no corrections needed")
+
+    return total_corrections
+
+
 def get_safety_settings():
     """Build permissive safety settings for subtitle translation content."""
     return [
@@ -3477,6 +3786,8 @@ def translate_ass_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=False,
+    review_batch_size=150,
 ):
     """
     Translates subtitle file using batch processing (simplified from multi-tier approach).
@@ -4280,6 +4591,29 @@ def translate_ass_file(
             # Then restore ASS formatting tags
             event.text = restore_formatting(original_texts[i], restored_directives)
 
+        # --- Review pass: check for gender, consistency, and quality issues ---
+        if review:
+            try:
+                review_corrections = review_translation(
+                    dialogue_events=dialogue_events,
+                    original_texts=original_texts,
+                    translated_subtitle=translated_subtitle,
+                    source_lang=lang_code,
+                    target_lang="Latin American Spanish",
+                    api_manager=api_manager,
+                    model_name=model_name,
+                    thinking=thinking,
+                    thinking_budget=thinking_budget,
+                    extra_context_text=extra_context_text,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    review_batch_size=review_batch_size,
+                )
+                logger.info(f"Review applied {review_corrections} correction(s)")
+            except Exception as e:
+                logger.warning(f"Review pass failed (translation is still saved): {e}")
+
         # Remove SDH-only events from the subtitle file before saving
         if strip_sdh and sdh_events_to_remove:
             for event in sdh_events_to_remove:
@@ -4892,6 +5226,8 @@ def process_mkv_ocr_file(
     top_k=None,
     strip_sdh=False,
     skip_ocr_review=False,
+    review=False,
+    review_batch_size=150,
 ):
     """Process a hard-subbed MKV by OCRing burned-in subtitles before translation."""
     print(f"\n{'=' * 60}")
@@ -5254,6 +5590,8 @@ def process_mkv_ocr_file(
             top_p,
             top_k,
             strip_sdh,
+            review,
+            review_batch_size,
         )
 
         if translated_subtitle_path:
@@ -5283,6 +5621,8 @@ def process_raw_subtitle_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=False,
+    review_batch_size=150,
 ):
     """Translate a standalone text subtitle file directly."""
     source_lang = normalize_track_language(source_lang)
@@ -5328,6 +5668,8 @@ def process_raw_subtitle_file(
         top_p,
         top_k,
         strip_sdh,
+        review,
+        review_batch_size,
     )
 
     if translated_subtitle_path:
@@ -5355,6 +5697,8 @@ def process_mkv_file(
     top_p=None,
     top_k=None,
     strip_sdh=False,
+    review=False,
+    review_batch_size=150,
 ):
     """
     Processes a single MKV file: detects subtitles, prompts for selection (if needed),
@@ -5450,6 +5794,8 @@ def process_mkv_file(
             top_p,
             top_k,
             strip_sdh,
+            review,
+            review_batch_size,
         )
 
         # 5. Merge the translated subtitle back into a new MKV
@@ -5609,6 +5955,18 @@ def main():
         "--strip-sdh",
         action="store_true",
         help="Remove SDH (Subtitles for Deaf/Hard of Hearing) elements like [sound effects], speaker names, and music symbols.",
+    )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="After translation, run a review pass to check for gender agreement, "
+        "consistency, untranslated leaks, and register issues.",
+    )
+    parser.add_argument(
+        "--review-batch-size",
+        type=int,
+        default=150,
+        help="Number of lines per review batch (default: 150). Only used with --review.",
     )
     parser.add_argument(
         "--temperature",
@@ -5903,6 +6261,8 @@ def main():
                     top_k=args.top_k,
                     strip_sdh=args.strip_sdh,
                     skip_ocr_review=args.skip_ocr_review,
+                    review=args.review,
+                    review_batch_size=args.review_batch_size,
                 )
             else:
                 chosen_lang, chosen_secondary_lang, final_batch_size = process_mkv_file(
@@ -5924,6 +6284,8 @@ def main():
                     args.top_p,
                     args.top_k,
                     args.strip_sdh,
+                    args.review,
+                    args.review_batch_size,
                 )
                 # Remember language selection for subsequent files
                 if chosen_lang:
@@ -5954,6 +6316,8 @@ def main():
                 top_p=args.top_p,
                 top_k=args.top_k,
                 strip_sdh=args.strip_sdh,
+                review=args.review,
+                review_batch_size=args.review_batch_size,
             )
         # Remember batch size adjustment for subsequent files
         if final_batch_size and final_batch_size != remembered_batch_size:
